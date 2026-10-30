@@ -206,7 +206,8 @@ function Test-CtxModuleSignature {
             Status  = [string]$sig.Status
             Signer  = $sig.SignerCertificate
             Message = $sig.StatusMessage
-            Block   = [IO.File]::ReadAllText($file).Contains('# SIG # Begin signature block')
+            # Only a real signature block counts (own line); this very code mentions the marker inside a string.
+            Block   = [IO.File]::ReadAllText($file) -match '(?m)^# SIG # Begin signature block\r?$'
         }
     }
     $checks = @($checks)

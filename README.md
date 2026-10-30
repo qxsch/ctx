@@ -6,7 +6,7 @@ One command to jump between your tenants:
 ctx emea -Admin      # switch Azure CLI + Az PowerShell, activate Global Admin (PIM), prepare Graph for daily admin work
 ```
 
-**Environment = tenant + login.** You give every tenant/login pair a name (`switzerland`, `emea`, `emea3`, `germany`, ...).
+**Environment = tenant + login.** You give every tenant/login pair a name (`switzerland`, `emea`, `germany`, ...).
 The same tenant with the same login is the same environment (ctx refuses duplicates). The same tenant with a different login is a different environment.
 
 ## Install

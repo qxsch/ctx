@@ -1307,6 +1307,11 @@ Describe 'Reliability and safety' {
         ($r | Where-Object Area -EQ 'Environment bad').Status | Should -Be 'fail'
         @($r | Where-Object Area -Like 'bad*').Count | Should -Be 0
     }
+    It 'does not report the loaded module as tampered' {
+        $base = (Get-Module Ctx).ModuleBase
+        $r = InModuleScope Ctx -Parameters @{ B = $base } { param($B) Test-CtxModuleSignature -ModuleBase $B }
+        $r.Status | Should -Not -Be 'fail' -Because $r.Detail
+    }
     It 'keeps an unset LASTEXITCODE unset in the prompt (strict mode)' {
         Set-TestState -Current 'x' -Environments @((New-TestEnv 'x' $T1 $O1))
         $had = Get-Variable -Name LASTEXITCODE -Scope Global -ErrorAction Ignore
@@ -1328,7 +1333,9 @@ Describe 'Module signature check' {
         New-Item -ItemType Directory -Path $sigDir -Force | Out-Null
         function Set-SigFiles([hashtable]$Status, [string[]]$WithBlock = @()) {
             foreach ($n in 'Ctx.psm1', 'Ctx.psd1', 'Ctx.Format.ps1xml') {
-                $text = if ($WithBlock -contains $n) { "x`n# SIG # Begin signature block`n# abc`n# SIG # End signature block`n# appended" } else { 'x' }
+                $text = if ($WithBlock -contains $n) { "x`n# SIG # Begin signature block`n# abc`n# SIG # End signature block`n# appended" }
+                elseif ($WithBlock -contains "quoted:$n") { "    Block = `$text -match '(?m)^# SIG # Begin signature block\r?$'`n    `$y = '# SIG # Begin signature block'" }
+                else { 'x' }
                 Set-Content -LiteralPath (Join-Path $sigDir $n) -Value $text
             }
             $script:sigStatus = $Status
@@ -1345,6 +1352,7 @@ Describe 'Module signature check' {
         @{ Case = 'edited content'; Status = @{ 'Ctx.psm1' = 'HashMismatch'; 'Ctx.psd1' = 'Valid'; 'Ctx.Format.ps1xml' = 'Valid' }; Block = @(); Expected = 'fail'; Detail = 'Ctx.psm1 changed after*' }
         @{ Case = 'text appended after the signature'; Status = @{ 'Ctx.psm1' = 'NotSigned'; 'Ctx.psd1' = 'NotSigned'; 'Ctx.Format.ps1xml' = 'NotSigned' }; Block = @('Ctx.psm1'); Expected = 'fail'; Detail = 'Ctx.psm1 changed after*' }
         @{ Case = 'a stripped signature'; Status = @{ 'Ctx.psm1' = 'NotSigned'; 'Ctx.psd1' = 'Valid'; 'Ctx.Format.ps1xml' = 'Valid' }; Block = @(); Expected = 'fail'; Detail = 'Ctx.psm1 changed after*' }
+        @{ Case = 'the marker quoted in unsigned code'; Status = @{ 'Ctx.psm1' = 'NotSigned'; 'Ctx.psd1' = 'NotSigned'; 'Ctx.Format.ps1xml' = 'NotSigned' }; Block = @('quoted:Ctx.psm1'); Expected = 'info'; Detail = 'not signed*' }
     ) {
         param($Case, $Status, $Block, $Expected, $Detail)
         Set-SigFiles -Status $Status -WithBlock $Block
