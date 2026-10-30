@@ -356,7 +356,7 @@ function Set-CtxEnvironment {
     .PARAMETER AdminOnSwitch
     Ask = offer PIM + Graph after switching, Always = do it automatically, Never = don't ask, Default = use config.
     .PARAMETER GraphProfile
-    Graph scope profile: All, Admin, ReadOnly, Pim, a custom profile from config, or a scope list. 'Default' clears it.
+    Graph scope profile: Admin, ReadOnly, Pim, a custom profile from config, or a scope list. 'Default' clears it.
     .EXAMPLE
     ctx set germany -AddTag prod -Color Red
     .EXAMPLE

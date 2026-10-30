@@ -398,7 +398,7 @@ function Get-CtxHelp {
         '# admin'
         'ctx pim [role] :: activate (default Global Admin) + Graph; -Hours -Reason -Ticket -NoGraph'
         'ctx pim -List | -Deactivate | -Renew :: eligible/active roles, end early, start a fresh activation'
-        'ctx graph [profile] :: reuse/renew Graph: Admin, ReadOnly, Pim, All, custom or "Scope1,Scope2"'
+        'ctx graph [profile] :: reuse/renew Graph: Admin, ReadOnly, Pim, custom or "Scope1,Scope2"'
         'ctx graph -AddScopes "Scope1,Scope2" :: extend this session; consent only if needed'
         'ctx graph -Relogin :: explicitly sign in with a fresh device code'
         '# everyday'

@@ -29,7 +29,6 @@ $script:CtxReservedNames = @($script:CtxVerbs.Keys) + @('-', 'all', 'none', 'cur
 
 $script:CtxDefaultConfig = [ordered]@{
     defaultGraphProfile  = 'Admin'
-    fallbackGraphProfile = 'Admin'
     askAdminOnSwitch     = $true
     verifyOnSwitch       = $true
     promptBadge          = $true
@@ -208,6 +207,9 @@ function Repair-CtxEnvironmentEntry {
         if ($null -ne $Entry[$k]) { $Entry[$k] = ConvertTo-CtxSafeText $Entry[$k] }
     }
     $Entry['activations'] = ConvertTo-CtxList $Entry['activations']
+    if ([string]$Entry['graphProfile'] -ieq 'All' -and (Test-CtxRemovedGraphProfile 'All' (Get-CtxConfig).graphScopeProfiles)) {
+        $Entry['graphProfile'] = $null
+    }
     if ($Entry['pim'] -isnot [System.Collections.IDictionary]) { $Entry['pim'] = [ordered]@{} }
     foreach ($k in 'role', 'reason', 'ticketSystem') {
         if ($null -ne $Entry['pim'][$k]) { $Entry['pim'][$k] = ConvertTo-CtxSafeText $Entry['pim'][$k] }
@@ -303,10 +305,14 @@ function Get-CtxConfig {
     if (Test-Path -LiteralPath $path) {
         try {
             $data = [IO.File]::ReadAllText($path) | ConvertFrom-Json -AsHashtable -Depth 16
-            foreach ($k in @($data.Keys)) { $cfg[$k] = $data[$k] }
+            # Known settings only: removed settings (e.g. fallbackGraphProfile) in older files are ignored.
+            foreach ($k in @($data.Keys)) { if ($script:CtxDefaultConfig.Contains($k)) { $cfg[$k] = $data[$k] } }
         } catch {
             Write-Warning "ctx: ignoring invalid config file '$path': $($_.Exception.Message)"
         }
+    }
+    if (Test-CtxRemovedGraphProfile ([string]$cfg.defaultGraphProfile) $cfg.graphScopeProfiles) {
+        $cfg.defaultGraphProfile = $script:CtxDefaultConfig.defaultGraphProfile
     }
     $script:ConfigCache = $cfg
     $script:ConfigCacheStamp = $stamp

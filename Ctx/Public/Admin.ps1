@@ -231,7 +231,7 @@ function Connect-CtxGraph {
     .SYNOPSIS
     Connects Microsoft Graph using cached credentials, silent refresh, or device code when necessary.
     .PARAMETER Scopes
-    Scope profile (All, Admin, ReadOnly, Pim, custom from config) or a comma separated scope list. Default: the
+    Scope profile (Admin, ReadOnly, Pim, custom from config) or a comma separated scope list. Default: the
     environment's profile, else config defaultGraphProfile (Admin). An explicit profile replaces session additions.
     .PARAMETER AddScopes
     Add permissions to the current session, or to the selected/default profile if no session exists.
@@ -240,8 +240,6 @@ function Connect-CtxGraph {
     Obtain a fresh token, silently when possible. Used after PIM activation.
     .PARAMETER Relogin
     Skip cached credentials and explicitly sign in with device code.
-    .PARAMETER NoFallback
-    Do not retry with the fallback profile when the sign-in with all scopes fails.
     .EXAMPLE
     ctx graph
     .EXAMPLE
@@ -257,7 +255,6 @@ function Connect-CtxGraph {
         [string]$Scopes,
         [string[]]$AddScopes,
         [string]$Environment,
-        [switch]$NoFallback,
         [switch]$Refresh,
         [switch]$Relogin
     )
@@ -275,24 +272,7 @@ function Connect-CtxGraph {
         $list = @($list + $extra | Select-Object -Unique)
     }
     Write-CtxMsg step "Preparing Microsoft Graph · profile $profileName ($($list.Count) scopes)"
-    try {
-        $mg = Connect-CtxGraphSession -Entry $entry -Scopes $list -Label $profileName -Refresh:$Refresh -Relogin:$Relogin
-    } catch {
-        $msg = $_.Exception.Message
-        $fallback = [string]$cfg.fallbackGraphProfile
-        $userAbort = $msg -match 'expired|cancel|declined|timed? ?out|AADSTS70019|AADSTS65004|AADSTS50126|signed in as|signed into tenant'
-        if ($NoFallback -or $AddScopes -or $profileName -ne 'All' -or -not $fallback -or $fallback -eq $profileName -or $userAbort) { throw }
-        Write-CtxMsg warn "Graph sign-in with '$profileName' failed: $(if ($msg.Length -gt 160) { $msg.Substring(0, 157) + '...' } else { $msg })"
-        Write-CtxMsg step "Retrying with the '$fallback' profile"
-        $list = Get-CtxGraphScopes $fallback
-        $mg = Connect-CtxGraphSession -Entry $entry -Scopes $list -Label $fallback
-        if (-not $Scopes) {
-            $targetName = $entry.name
-            $null = Update-CtxState { param($s) $e = Find-CtxEnvironment $s $targetName; if ($e) { $e.graphProfile = $fallback } }
-            Write-CtxMsg dim "Remembered '$fallback' for '$($entry.name)' (ctx set $($entry.name) -GraphProfile Default to try '$profileName' again)."
-        }
-        $profileName = $fallback
-    }
+    $mg = Connect-CtxGraphSession -Entry $entry -Scopes $list -Label $profileName -Refresh:$Refresh -Relogin:$Relogin
     Write-CtxMsg ok "Microsoft Graph connected · $($mg.Account) · $profileName · $(@($mg.Scopes).Count) scopes granted"
 }
 

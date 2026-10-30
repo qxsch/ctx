@@ -1,6 +1,6 @@
 @{
     RootModule           = 'Ctx.psm1'
-    ModuleVersion        = '1.1.0'
+    ModuleVersion        = '1.2.0'
     GUID                 = '6f0b8a52-3c1e-4d3b-9a47-2f5c8e1d7b90'
     Author               = 'qxsch'
     Copyright            = '(c) qxsch. MIT License.'
@@ -26,6 +26,11 @@
             ProjectUri   = 'https://github.com/qxsch/ctx'
             LicenseUri   = 'https://github.com/qxsch/ctx/blob/main/LICENSE'
             ReleaseNotes = @'
+1.2.0
+- Removed the 'All' Graph scope profile: requesting every delegated permission violates least privilege and Entra
+  rejects it. Its fallback machinery is gone too (setting fallbackGraphProfile, Connect-CtxGraph -NoFallback). A stored
+  'All' (environment or defaultGraphProfile) falls back to the default 'Admin'; a custom profile named 'All' still works.
+
 1.1.0
 - Security: 'ctx import' accepts only portable fields, validates IDs (GUID) and tenant domains, asks before keeping a
   custom graphClientId, and strips terminal control characters. az.cmd arguments with shell metacharacters are refused;

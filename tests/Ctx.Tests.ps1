@@ -138,10 +138,6 @@ Describe 'Helpers' {
         InModuleScope Ctx -Parameters @{ M = $Minutes } { param($M) Format-CtxDuration ([timespan]::FromMinutes($M)) } | Should -Be $Expected
     }
     It 'formats unlimited durations' { InModuleScope Ctx { Format-CtxDuration $null } | Should -Be '∞' }
-    It 'reduces Read scopes when ReadWrite is requested' {
-        $r = InModuleScope Ctx { Get-CtxReducedScopes @('User.Read.All', 'User.ReadWrite.All', 'Mail.Read') }
-        $r | Should -Be @('User.ReadWrite.All', 'Mail.Read')
-    }
     It 'writes INI values' {
         $f = Join-Path $testHome 'test.ini'
         Set-Content -LiteralPath $f -Value "[core]`noutput = json`n[cloud]`nname = AzureCloud"
@@ -241,6 +237,37 @@ Describe 'PIM and Graph helpers' {
             InModuleScope Ctx { Get-CtxGraphScopes 'Intune' } | Should -Be @('DeviceManagementManagedDevices.Read.All', 'DeviceManagementConfiguration.Read.All')
         } finally { Set-CtxConfig -Reset 6>$null }
     }
+    It 'has no profile that requests every delegated permission' {
+        Mock -ModuleName Ctx Get-CtxDelegatedPermissionNames { throw 'must not enumerate all permissions' }
+        { InModuleScope Ctx { Get-CtxGraphScopes 'All' } } | Should -Throw "*'All' Graph profile was removed*least privilege*"
+        { InModuleScope Ctx { Get-CtxGraphScopes 'all' } } | Should -Throw '*was removed*'
+        $offered = @(InModuleScope Ctx { Get-CtxGraphProfileCompletion '' }).CompletionText
+        $offered | Should -Be @('Admin', 'ReadOnly', 'Pim')
+        Set-TestState -Current 'alpha' -Environments @((New-TestEnv 'alpha' $T1 $O1))
+        { ctx set alpha -GraphProfile All } | Should -Throw '*was removed*'
+        (Get-Command Connect-CtxGraph).Parameters.ContainsKey('NoFallback') | Should -BeFalse
+        InModuleScope Ctx { $script:CtxDefaultConfig.Contains('fallbackGraphProfile') } | Should -BeFalse
+    }
+    It 'migrates a stored All profile from older versions to the default' {
+        $cfgFile = Join-Path $testHome 'config.json'
+        Set-Content -LiteralPath $cfgFile -Value '{ "defaultGraphProfile": "All", "fallbackGraphProfile": "Admin", "pimDefaultHours": 2 }'
+        try {
+            $cfg = Get-CtxConfig
+            $cfg.defaultGraphProfile | Should -Be 'Admin'
+            $cfg.Contains('fallbackGraphProfile') | Should -BeFalse
+            $cfg.pimDefaultHours | Should -Be 2
+            Set-TestState -Current 'alpha' -Environments @(@{ name = 'alpha'; tenantId = $T1; userObjectId = $O1; graphProfile = 'All' })
+            (Get-TestState).environments[0].graphProfile | Should -BeNullOrEmpty
+        } finally { Remove-Item -LiteralPath $cfgFile -Force -ErrorAction SilentlyContinue }
+    }
+    It 'keeps a custom profile that happens to be named All' {
+        Set-CtxConfig 'graphScopeProfiles.All' 'User.Read.All' 6>$null
+        try {
+            InModuleScope Ctx { Get-CtxGraphScopes 'All' } | Should -Be @('User.Read.All')
+            Set-TestState -Current 'alpha' -Environments @(@{ name = 'alpha'; tenantId = $T1; userObjectId = $O1; graphProfile = 'All' })
+            (Get-TestState).environments[0].graphProfile | Should -Be 'All'
+        } finally { Set-CtxConfig -Reset 6>$null }
+    }
 }
 
 Describe 'Graph sign-in' {
@@ -315,7 +342,7 @@ Describe 'Graph sign-in' {
             $responses.Enqueue([pscustomobject]@{ access_token = $at; refresh_token = 'rt-1'; expires_in = 3600 })
             Mock -ModuleName Ctx Invoke-CtxOAuth { $responses.Dequeue() } -ParameterFilter { $Endpoint -eq 'token' }
 
-            $r = InModuleScope Ctx -Parameters @{ E = $gEntry } { param($E) Connect-CtxGraphSession -Entry $E -Scopes @('User.Read.All', 'Group.Read.All') -Label 'All' }
+            $r = InModuleScope Ctx -Parameters @{ E = $gEntry } { param($E) Connect-CtxGraphSession -Entry $E -Scopes @('User.Read.All', 'Group.Read.All') -Label 'Admin' }
 
             $r.Account | Should -Be 'graphy@contoso.com'
             $r.Scopes | Should -Be @('User.Read.All', 'Group.Read.All')
@@ -323,14 +350,14 @@ Describe 'Graph sign-in' {
                 $Endpoint -eq 'devicecode' -and $TenantId -eq '11111111-1111-1111-1111-111111111111' -and
                 $Body.client_id -eq '14d82eec-204b-4c2f-b7e8-296a70dab67e' -and $Body.scope -eq 'User.Read.All Group.Read.All offline_access openid profile'
             }
-            Should -Invoke Show-CtxDeviceCode -ModuleName Ctx -Times 1 -Exactly -ParameterFilter { $Code -eq 'ABC123' -and $Tool -eq 'Microsoft Graph (All)' }
+            Should -Invoke Show-CtxDeviceCode -ModuleName Ctx -Times 1 -Exactly -ParameterFilter { $Code -eq 'ABC123' -and $Tool -eq 'Microsoft Graph (Admin)' }
             Should -Invoke Start-Sleep -ModuleName Ctx -Times 2 -Exactly -ParameterFilter { $Seconds -eq 5 }
             Should -Invoke Start-Sleep -ModuleName Ctx -Times 1 -Exactly -ParameterFilter { $Seconds -eq 10 }
             Should -Invoke Connect-CtxGraphToken -ModuleName Ctx -Times 1 -Exactly -ParameterFilter { $AccessToken -eq $at }
             Should -Invoke Start-CtxGraphRenewal -ModuleName Ctx -Times 1 -Exactly
             InModuleScope Ctx {
                 $script:GraphEnvName | Should -Be 'graphy'
-                $script:GraphProfileName | Should -Be 'All'
+                $script:GraphProfileName | Should -Be 'Admin'
                 $script:GraphToken.RefreshToken | Should -Be 'rt-1'
                 $script:GraphToken.ExpiresAt | Should -BeGreaterThan ([datetime]::UtcNow.AddMinutes(55))
             }
@@ -343,7 +370,7 @@ Describe 'Graph sign-in' {
                 )) {
                 $at = New-TestJwt $case.Claims
                 Mock -ModuleName Ctx Invoke-CtxOAuth { [pscustomobject]@{ access_token = $at; refresh_token = 'rt' } } -ParameterFilter { $Endpoint -eq 'token' }
-                { InModuleScope Ctx -Parameters @{ E = $gEntry } { param($E) Connect-CtxGraphSession -Entry $E -Scopes @('User.Read') -Label 'All' } } |
+                { InModuleScope Ctx -Parameters @{ E = $gEntry } { param($E) Connect-CtxGraphSession -Entry $E -Scopes @('User.Read') -Label 'Admin' } } |
                     Should -Throw $case.Expected
             }
             Should -Invoke Connect-CtxGraphToken -ModuleName Ctx -Times 0 -Exactly
@@ -358,15 +385,15 @@ Describe 'Graph sign-in' {
                     @{ Response = @{ error = 'authorization_declined' }; Expected = '*declined*' }
                     @{ Response = @{ error = 'expired_token' }; Expected = '*code expired*' }
                     @{ Response = @{ error = 'invalid_scope'; error_description = 'AADSTS70011: The provided value for scope is not valid. Trace ID: 1' }
-                        Expected = 'Microsoft Graph (All) sign-in failed: AADSTS70011: The provided value for scope is not valid.' }
+                        Expected = 'Microsoft Graph (Admin) sign-in failed: AADSTS70011: The provided value for scope is not valid.' }
                 )) {
                 $resp = [pscustomobject]$case.Response
                 Mock -ModuleName Ctx Invoke-CtxOAuth { $resp } -ParameterFilter { $Endpoint -eq 'token' }
-                { InModuleScope Ctx -Parameters @{ E = $gEntry } { param($E) Connect-CtxGraphSession -Entry $E -Scopes @('User.Read') -Label 'All' } } |
+                { InModuleScope Ctx -Parameters @{ E = $gEntry } { param($E) Connect-CtxGraphSession -Entry $E -Scopes @('User.Read') -Label 'Admin' } } |
                     Should -Throw $case.Expected
             }
             Mock -ModuleName Ctx Invoke-CtxOAuth { [pscustomobject]@{ error = 'invalid_client'; error_description = 'AADSTS7000218: client_assertion missing.' } } -ParameterFilter { $Endpoint -eq 'devicecode' }
-            { InModuleScope Ctx -Parameters @{ E = $gEntry } { param($E) Connect-CtxGraphSession -Entry $E -Scopes @('User.Read') -Label 'All' } } |
+            { InModuleScope Ctx -Parameters @{ E = $gEntry } { param($E) Connect-CtxGraphSession -Entry $E -Scopes @('User.Read') -Label 'Admin' } } |
                 Should -Throw '*sign-in failed: AADSTS7000218*'
             Should -Invoke Connect-CtxGraphToken -ModuleName Ctx -Times 0 -Exactly
         }
@@ -809,11 +836,12 @@ Describe 'PIM and Graph login reuse' {
         Should -Invoke Invoke-CtxOAuth -ModuleName Ctx -Times 1 -Exactly -ParameterFilter { $Endpoint -eq 'token' -and $Body.grant_type -eq 'refresh_token' }
     }
 
-    It 'never falls back to another profile when explicit scope additions fail' {
-        Mock -ModuleName Ctx Get-CtxDelegatedPermissionNames { @('User.Read.All') }
+    It 'does not retry with another profile when the sign-in fails' {
         Mock -ModuleName Ctx Connect-CtxGraphSession { throw 'AADSTS70011: invalid_scope' }
-        { Connect-CtxGraph -Scopes All -AddScopes NotAReal.Scope } | Should -Throw '*invalid_scope*'
-        Should -Invoke Connect-CtxGraphSession -ModuleName Ctx -Times 1 -Exactly
+        { Connect-CtxGraph -AddScopes NotAReal.Scope } | Should -Throw '*invalid_scope*'
+        { Connect-CtxGraph } | Should -Throw '*invalid_scope*'
+        Should -Invoke Connect-CtxGraphSession -ModuleName Ctx -Times 2 -Exactly
+        (Get-TestState).environments[0].graphProfile | Should -BeNullOrEmpty
     }
 
     It 'replaces additions when an explicit narrower profile is selected' {

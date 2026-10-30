@@ -64,7 +64,7 @@ cd ctx
 | `ctx set [name] ...` | `-AddTag/-RemoveTag/-Tags`, `-Color`, `-Description`, `-Tools`, `-PimRole`, `-PimHours`, `-PimReason`, `-TicketSystem`, `-GraphProfile`, `-GraphClientId`, `-AdminOnSwitch Ask/Always/Never/Default` |
 | `ctx pim [role]` | Activate a PIM role (default Global Administrator) + Graph; `-Hours -Reason -Ticket -NoGraph -Wait` |
 | `ctx pim -List` / `-Deactivate` / `-Renew` | Eligible/active roles, end an activation early, start a fresh one |
-| `ctx graph [profile]` | Reuse/renew Graph, or use device code if needed; `Admin`, `ReadOnly`, `Pim`, `All`, custom or `"Scope1,Scope2"` |
+| `ctx graph [profile]` | Reuse/renew Graph, or use device code if needed; `Admin`, `ReadOnly`, `Pim`, custom or `"Scope1,Scope2"` |
 | `ctx graph -AddScopes "Scope1,Scope2"` | Add permissions to this terminal's session; try silent consent reuse first |
 | `ctx graph -Relogin` | Explicitly request a fresh device-code sign-in |
 | `ctx st [-Check]` | Status of this terminal (`-Check` verifies the tokens) |
@@ -107,7 +107,7 @@ Tab completion covers environment names, verbs, roles, portals, subscriptions, G
    - Normally this means **zero Graph device codes** when suitable credentials can be reused, or **one** otherwise.
    - New consent, revoked credentials, or Conditional Access/MFA can require interaction. If initial admin consent needs an active role, use `ctx pim -NoGraph` first, then `ctx graph`.
    - Az's token API cannot force a new token after activation. In that case ctx can use one device-code sign-in for a fresh Graph token, then keep renewing it itself.
-   - `All` remains opt-in (`ctx graph All`). If that oversized request fails, ctx can fall back to `Admin`; explicit `-AddScopes` requests are never silently dropped.
+   - There is no "all scopes" profile: requesting every delegated permission violates least privilege and Entra rejects such requests. Use a focused profile and add what you need with `-AddScopes`; explicit additions are never silently dropped.
 
 Activations are cached locally. The badge shows the time left (`GA 1h34m`, yellow below 10 minutes), and a one-time reminder is printed shortly before and right after expiry. `ctx pim -Renew` starts a new activation.
 
@@ -140,7 +140,7 @@ The default `Admin` profile is **11 delegated Graph scopes**, derived from the a
 
 `Application.Read.All` is retained alongside its write equivalent because the Fabric setup script checks for that exact scope. Permissions that the scripts grant to an application are not automatically permissions needed by the signed-in operator. For example, `Application.ReadWrite.OwnedBy` is an application permission, not a delegated scope.
 
-The fixed profiles do not depend on the SDK's permission catalogue, which can lag behind supported Graph permissions. `All` still uses that catalogue. Existing explicit environment/profile overrides are preserved.
+The fixed profiles do not depend on the SDK's permission catalogue, which can lag behind supported Graph permissions; the catalogue only feeds tab completion for `-AddScopes`. Existing explicit environment/profile overrides are preserved. A stored `All` profile from older versions falls back to the default (`Admin`).
 
 Add permissions only when you need them:
 
@@ -177,7 +177,6 @@ The badge wraps your existing prompt. Load ctx after oh-my-posh/starship, or tur
 | Key | Default | |
 |---|---|---|
 | `defaultGraphProfile` | `Admin` | Focused daily Graph scope profile after PIM |
-| `fallbackGraphProfile` | `Admin` | used when the All sign-in fails |
 | `askAdminOnSwitch` | `on` | offer PIM + Graph after a switch (per environment: `ctx set -AdminOnSwitch`) |
 | `verifyOnSwitch` | `on` | check tokens while switching (renews expired logins right away) |
 | `promptBadge` | `on` | prompt badge + PIM reminders |
@@ -236,7 +235,6 @@ GitHub Actions ([ci.yml](.github/workflows/ci.yml)) runs PSScriptAnalyzer and Pe
 - Azure public cloud only.
 - Switching is user-wide for **new** processes. Terminals that are already open follow after `ctx sync`. Graph is always per terminal.
 - `ctx add` signs in with a device code, so Conditional Access policies that block device code flow will block it.
-- The **All** scope profile requests several hundred scopes. Some tenants reject such a large request; the automatic fallback to `Admin` covers that.
 - PIM for Entra roles only (no Azure resource roles and no PIM for groups).
 
 ## License

@@ -1,4 +1,4 @@
-# Microsoft Graph: device-code sessions bound to this terminal, scope profiles All / Admin / ReadOnly / Pim / custom.
+# Microsoft Graph: device-code sessions bound to this terminal, scope profiles Admin / ReadOnly / Pim / custom.
 # Cached tokens are reused before falling back to ctx's device-code flow (SDK issue #3495).
 # Graph refresh tokens stay in this process' memory.
 
@@ -12,7 +12,7 @@ $script:CtxAdminScopes = @(
     'Domain.Read.All', 'Policy.Read.AuthenticationMethod',
     'RoleManagement.ReadWrite.Directory', 'RoleEligibilitySchedule.Read.Directory', 'RoleAssignmentSchedule.ReadWrite.Directory'
 )
-$script:CtxBuiltInGraphProfiles = @('All', 'Admin', 'ReadOnly', 'Pim')
+$script:CtxBuiltInGraphProfiles = @('Admin', 'ReadOnly', 'Pim')
 
 function Import-CtxGraphModule {
     if (-not (Get-Module Microsoft.Graph.Authentication)) {
@@ -22,7 +22,7 @@ function Import-CtxGraphModule {
 }
 
 function Get-CtxDelegatedPermissionNames {
-    <# All delegated Graph permission names known to the installed SDK, cached per SDK version. #>
+    <# Delegated Graph permission names known to the installed SDK (tab completion for -AddScopes), cached per SDK version. #>
     Import-CtxGraphModule
     $ver = (Get-Module Microsoft.Graph.Authentication).Version.ToString()
     $cacheFile = Join-Path (Get-CtxHome) 'graph-permissions.json'
@@ -38,11 +38,10 @@ function Get-CtxDelegatedPermissionNames {
     $names
 }
 
-function Get-CtxReducedScopes {
-    <# Drops X.Read.Y when X.ReadWrite.Y is also requested (keeps the token small). #>
-    param([string[]]$Names)
-    $set = [Collections.Generic.HashSet[string]]::new([string[]]@($Names), [StringComparer]::OrdinalIgnoreCase)
-    @($Names | Where-Object { -not ($_ -match '\.Read\.' -and $set.Contains(($_ -replace '\.Read\.', '.ReadWrite.'))) })
+function Test-CtxRemovedGraphProfile {
+    <# True for the removed 'All' profile (every delegated permission), unless a custom profile is named 'All'. #>
+    param([AllowNull()][string]$Name, $CustomProfiles)
+    $Name -ieq 'All' -and -not ($CustomProfiles -is [System.Collections.IDictionary] -and $CustomProfiles.Contains('All'))
 }
 
 function Get-CtxGraphScopes {
@@ -52,7 +51,7 @@ function Get-CtxGraphScopes {
     if ($custom -and $custom.Contains($GraphProfile)) { return [string[]]@($custom[$GraphProfile]) }
     switch ($GraphProfile) {
         'All' {
-            return [string[]](Get-CtxReducedScopes (Get-CtxDelegatedPermissionNames))
+            throw "The 'All' Graph profile was removed: requesting every delegated permission violates least privilege and is rejected by Entra. Use Admin, ReadOnly, a custom profile (ctx config graphScopeProfiles.<name> ...) or ctx graph -AddScopes."
         }
         'Admin' { return [string[]]$script:CtxAdminScopes }
         'ReadOnly' {
@@ -66,7 +65,7 @@ function Get-CtxGraphScopes {
         default {
             $list = @($GraphProfile -split '[,;\s]+' | Where-Object { $_ })
             if ($list.Count -eq 1 -and $list[0] -notmatch '\.') {
-                throw "Unknown Graph scope profile '$GraphProfile'. Use All, Admin, ReadOnly, Pim, a custom profile from config, or a scope list."
+                throw "Unknown Graph scope profile '$GraphProfile'. Use Admin, ReadOnly, Pim, a custom profile from config, or a scope list."
             }
             return [string[]]$list
         }
