@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Pester and PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Install-PSResource -Name Pester -Version '[5.5.0,6.0.0)' -Repository PSGallery -TrustRepository -Scope CurrentUser -Quiet
+          Install-PSResource -Name PSScriptAnalyzer -Version '[1.22.0,2.0.0)' -Repository PSGallery -TrustRepository -Scope CurrentUser -Quiet
+
+      - name: Lint (PSScriptAnalyzer)
+        shell: pwsh
+        run: |
+          # File by file: folder-level -Recurse runs can fail intermittently inside the analyzer.
+          $files = @(Get-ChildItem -Path ./Ctx -Recurse -Include *.ps1, *.psm1, *.psd1) + @(Get-Item ./Install.ps1, ./Uninstall.ps1)
+          $findings = foreach ($f in $files) { Invoke-ScriptAnalyzer -Path $f.FullName -Settings ./PSScriptAnalyzerSettings.psd1 }
+          $findings | Format-Table -AutoSize ScriptName, Line, RuleName, Message | Out-String -Width 300
+          if ($findings) { throw "$(@($findings).Count) PSScriptAnalyzer finding(s)" }
+
+      - name: Test (Pester)
+        shell: pwsh
+        run: |
+          $cfg = New-PesterConfiguration
+          $cfg.Run.Path = './tests'
+          $cfg.Run.Exit = $true
+          $cfg.Output.Verbosity = 'Detailed'
+          $cfg.TestResult.Enabled = $true
+          $cfg.TestResult.OutputPath = 'testResults.xml'
+          Invoke-Pester -Configuration $cfg
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-results
+          path: testResults.xml
+          if-no-files-found: ignore

@@ -1,0 +1,113 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Configuration>
+  <ViewDefinitions>
+    <View>
+      <Name>Ctx.Environment</Name>
+      <ViewSelectedBy>
+        <TypeName>Ctx.Environment</TypeName>
+      </ViewSelectedBy>
+      <TableControl>
+        <AutoSize />
+        <TableHeaders>
+          <TableColumnHeader><Label> </Label></TableColumnHeader>
+          <TableColumnHeader><Label>Name</Label></TableColumnHeader>
+          <TableColumnHeader><Label>Tenant</Label></TableColumnHeader>
+          <TableColumnHeader><Label>Login</Label></TableColumnHeader>
+          <TableColumnHeader><Label>Tags</Label></TableColumnHeader>
+          <TableColumnHeader><Label>Admin</Label></TableColumnHeader>
+          <TableColumnHeader><Label>Last used</Label></TableColumnHeader>
+        </TableHeaders>
+        <TableRowEntries>
+          <TableRowEntry>
+            <TableColumnItems>
+              <TableColumnItem><PropertyName>Current</PropertyName></TableColumnItem>
+              <TableColumnItem>
+                <ScriptBlock>
+                  $codes = @{ Black = 30; DarkRed = 31; DarkGreen = 32; DarkYellow = 33; DarkBlue = 34; DarkMagenta = 35; DarkCyan = 36; Gray = 37; DarkGray = 90; Red = 91; Green = 92; Yellow = 93; Blue = 94; Magenta = 95; Cyan = 96; White = 97 }
+                  $code = $codes[[string]$_.Color]
+                  $label = if ($_.Prod) { "!$($_.Name)" } else { $_.Name }
+                  if ($code -and -not $env:NO_COLOR -and $Host.UI.SupportsVirtualTerminal) { "$([char]27)[$($code)m$label$([char]27)[0m" } else { $label }
+                </ScriptBlock>
+              </TableColumnItem>
+              <TableColumnItem><PropertyName>Tenant</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>Upn</PropertyName></TableColumnItem>
+              <TableColumnItem><ScriptBlock>@($_.Tags) -join ','</ScriptBlock></TableColumnItem>
+              <TableColumnItem><PropertyName>Admin</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>LastUsedAgo</PropertyName></TableColumnItem>
+            </TableColumnItems>
+          </TableRowEntry>
+        </TableRowEntries>
+      </TableControl>
+    </View>
+    <View>
+      <Name>Ctx.PimRole</Name>
+      <ViewSelectedBy>
+        <TypeName>Ctx.PimRole</TypeName>
+      </ViewSelectedBy>
+      <TableControl>
+        <AutoSize />
+        <TableHeaders>
+          <TableColumnHeader><Label>Role</Label></TableColumnHeader>
+          <TableColumnHeader><Label>Status</Label></TableColumnHeader>
+          <TableColumnHeader><Label>Remaining</Label></TableColumnHeader>
+          <TableColumnHeader><Label>Until</Label></TableColumnHeader>
+        </TableHeaders>
+        <TableRowEntries>
+          <TableRowEntry>
+            <TableColumnItems>
+              <TableColumnItem><PropertyName>Role</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>Status</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>Remaining</PropertyName></TableColumnItem>
+              <TableColumnItem><ScriptBlock>if ($_.Until) { $_.Until.ToString('g') }</ScriptBlock></TableColumnItem>
+            </TableColumnItems>
+          </TableRowEntry>
+        </TableRowEntries>
+      </TableControl>
+    </View>
+    <View>
+      <Name>Ctx.Setting</Name>
+      <ViewSelectedBy>
+        <TypeName>Ctx.Setting</TypeName>
+      </ViewSelectedBy>
+      <TableControl>
+        <AutoSize />
+        <TableHeaders>
+          <TableColumnHeader><Label>Setting</Label></TableColumnHeader>
+          <TableColumnHeader><Label>Value</Label></TableColumnHeader>
+          <TableColumnHeader><Label>Changed</Label></TableColumnHeader>
+        </TableHeaders>
+        <TableRowEntries>
+          <TableRowEntry>
+            <TableColumnItems>
+              <TableColumnItem><PropertyName>Name</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>Value</PropertyName></TableColumnItem>
+              <TableColumnItem><ScriptBlock>if ($_.Changed) { '✓' } else { '' }</ScriptBlock></TableColumnItem>
+            </TableColumnItems>
+          </TableRowEntry>
+        </TableRowEntries>
+      </TableControl>
+    </View>
+    <View>
+      <Name>Ctx.Check</Name>
+      <ViewSelectedBy>
+        <TypeName>Ctx.Check</TypeName>
+      </ViewSelectedBy>
+      <TableControl>
+        <TableHeaders>
+          <TableColumnHeader><Label>Status</Label><Width>6</Width></TableColumnHeader>
+          <TableColumnHeader><Label>Area</Label></TableColumnHeader>
+          <TableColumnHeader><Label>Detail</Label></TableColumnHeader>
+        </TableHeaders>
+        <TableRowEntries>
+          <TableRowEntry>
+            <TableColumnItems>
+              <TableColumnItem><PropertyName>Status</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>Area</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>Detail</PropertyName></TableColumnItem>
+            </TableColumnItems>
+          </TableRowEntry>
+        </TableRowEntries>
+      </TableControl>
+    </View>
+  </ViewDefinitions>
+</Configuration>

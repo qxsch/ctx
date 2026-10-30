@@ -1,0 +1,8 @@
+# Pester output
+testResults.xml
+coverage.xml
+
+# Editors and OS
+.vs/
+*.code-workspace
+Thumbs.db
