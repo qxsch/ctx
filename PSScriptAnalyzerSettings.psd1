@@ -11,5 +11,8 @@
         'PSReviewUnusedParameter'
         # Internal helpers only; every exported command that changes state supports -WhatIf (enforced by the tests).
         'PSUseShouldProcessForStateChangingFunctions'
+        # Depends on the locally installed modules: -Name of Select/Remove/Rename-AzContext is a dynamic parameter
+        # the analyzer cannot see, so results differ between machines with and without Az.Accounts loaded.
+        'PSUseCmdletCorrectly'
     )
 }
