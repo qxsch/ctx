@@ -27,9 +27,17 @@ jobs:
       - name: Lint (PSScriptAnalyzer)
         shell: pwsh
         run: |
-          # File by file: folder-level -Recurse runs can fail intermittently inside the analyzer.
+          # The analyzer intermittently crashes with a NullReferenceException; crashes are retried, findings still fail.
           $files = @(Get-ChildItem -Path ./Ctx -Recurse -Include *.ps1, *.psm1, *.psd1) + @(Get-Item ./Install.ps1, ./Uninstall.ps1)
-          $findings = foreach ($f in $files) { Invoke-ScriptAnalyzer -Path $f.FullName -Settings ./PSScriptAnalyzerSettings.psd1 }
+          $findings = foreach ($f in $files) {
+              for ($attempt = 1; ; $attempt++) {
+                  try { Invoke-ScriptAnalyzer -Path $f.FullName -Settings ./PSScriptAnalyzerSettings.psd1 -ErrorAction Stop; break }
+                  catch {
+                      if ($attempt -ge 3) { throw }
+                      Write-Warning "PSScriptAnalyzer crashed on $($f.Name) (attempt $attempt): $($_.Exception.Message) - retrying"
+                  }
+              }
+          }
           $findings | Format-Table -AutoSize ScriptName, Line, RuleName, Message | Out-String -Width 300
           if ($findings) { throw "$(@($findings).Count) PSScriptAnalyzer finding(s)" }
 
