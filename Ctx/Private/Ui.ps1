@@ -123,6 +123,41 @@ function Format-CtxCell {
     $Text.PadRight($Width)
 }
 
+function New-CtxMenuFrame {
+    param(
+        [Parameter(Mandatory)][string[]]$Rows,
+        [int]$Selected,
+        [int]$Start,
+        [ValidateRange(1, [int]::MaxValue)][int]$Width,
+        [ValidateRange(3, [int]::MaxValue)][int]$Height,
+        [string[]]$Colors,
+        [string]$Footer
+    )
+    $count = [math]::Min($Rows.Count, $Height - 2)
+    $Start = [math]::Max(0, [math]::Min($Start, $Rows.Count - $count))
+    if ($Selected -lt $Start) { $Start = $Selected }
+    elseif ($Selected -ge $Start + $count) { $Start = $Selected - $count + 1 }
+
+    $esc = $script:CtxEsc
+    $reset = Get-CtxAnsiReset
+    $sb = [Text.StringBuilder]::new()
+    for ($i = $Start; $i -lt $Start + $count; $i++) {
+        $num = if ($i -lt 9) { "$($i + 1)" } else { ' ' }
+        $text = if ($Width -gt 2) { Format-CtxCell (" $num  " + ($Rows[$i] -replace '[\r\n\t]', ' ')) ($Width - 2) } else { '' }
+        $bullet = if ($Colors -and $Colors[$i]) { (Get-CtxAnsi $Colors[$i]) + '●' + $reset } else { '●' }
+        if ($Width -eq 1) { $bullet = ''; $text = '' }
+        if ($i -eq $Selected) {
+            [void]$sb.Append("$esc[2K`r$esc[1;96m›$reset$bullet$esc[7m$text$reset`n")
+        } else {
+            [void]$sb.Append("$esc[2K`r $bullet$text`n")
+        }
+    }
+    $footerText = Format-CtxCell ("  " + ($Footer -replace '[\r\n\t]', ' ')) $Width
+    # Leave the cursor on the footer: its newline would scroll a full-height menu.
+    [void]$sb.Append("$esc[2K`r$esc[90m$footerText$reset$esc[J")
+    @{ Text = $sb.ToString(); Start = $Start; Count = $count }
+}
+
 function Show-CtxMenu {
     <#
     Arrow-key menu. Returns @{ Index = n; Key = 'enter' | <extra key char> } or $null when cancelled.
@@ -139,30 +174,32 @@ function Show-CtxMenu {
     if (-not (Test-CtxInteractive)) { throw 'No interactive console available for the picker. Pass a name instead.' }
     if ($Rows.Count -eq 0) { return $null }
     $esc = $script:CtxEsc
-    $reset = Get-CtxAnsiReset
     $sel = [math]::Max(0, [math]::Min($Default, $Rows.Count - 1))
-    $width = try { [math]::Max(40, [Console]::WindowWidth - 2) } catch { 120 }
     $cursorWasVisible = try { [Console]::CursorVisible } catch { $true }
-    if ($Title) { Write-Host $Title -ForegroundColor Cyan }
-    $first = $true
+    $start = 0
+    $previousCount = 0
     try {
         try { [Console]::CursorVisible = $false } catch { Write-Debug "ctx: cannot hide the cursor: $_" }
         while ($true) {
-            $sb = [Text.StringBuilder]::new()
-            if (-not $first) { [void]$sb.Append("$esc[$($Rows.Count + 1)A") }
-            $first = $false
-            for ($i = 0; $i -lt $Rows.Count; $i++) {
-                $num = if ($i -lt 9) { "$($i + 1)" } else { ' ' }
-                $text = Format-CtxCell (" $num  " + $Rows[$i]) ($width - 3)
-                $bullet = if ($Colors -and $Colors[$i]) { (Get-CtxAnsi $Colors[$i]) + '●' + $reset } else { '●' }
-                if ($i -eq $sel) {
-                    [void]$sb.Append("$esc[2K`r$esc[1;96m›$reset$bullet$esc[7m$text$reset`n")
-                } else {
-                    [void]$sb.Append("$esc[2K`r $bullet$text`n")
-                }
+            try {
+                $width = [math]::Max(1, [Console]::WindowWidth - 1)
+                $height = [math]::Max(3, [Console]::WindowHeight)
+            } catch {
+                Write-Debug "ctx: cannot read the console size: $_"
+                $width = 119
+                $height = 25
             }
-            [void]$sb.Append("$esc[2K`r$esc[90m  $Footer$reset`n")
-            [Console]::Write($sb.ToString())
+            if ($previousCount -eq 0 -and $Title) {
+                Write-Host (Format-CtxCell ($Title -replace '[\r\n\t]', ' ') $width) -ForegroundColor Cyan
+            }
+            $frame = New-CtxMenuFrame -Rows $Rows -Selected $sel -Start $start -Width $width -Height $height -Colors $Colors -Footer $Footer
+            if ($previousCount -gt 0) {
+                $rewind = [math]::Min($previousCount, $height - 1)
+                [Console]::Write("$esc[$($rewind)A")
+            }
+            [Console]::Write($frame.Text)
+            $start = $frame.Start
+            $previousCount = $frame.Count
 
             $key = [Console]::ReadKey($true)
             $ch = [char]::ToLowerInvariant($key.KeyChar)
@@ -179,6 +216,7 @@ function Show-CtxMenu {
             elseif ($ExtraKeys -contains $ch) { return @{ Index = $sel; Key = [string]$ch } }
         }
     } finally {
+        if ($previousCount -gt 0) { [Console]::WriteLine() }
         try { [Console]::CursorVisible = $cursorWasVisible } catch { Write-Debug "ctx: cannot restore the cursor: $_" }
     }
 }

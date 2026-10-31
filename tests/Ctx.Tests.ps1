@@ -180,6 +180,85 @@ Describe 'Helpers' {
     }
 }
 
+Describe 'Picker sliding window' {
+    It 'fits lists below, at and above the terminal height minus two' -TestCases @(
+        @{ Items = 1; Visible = 1 }, @{ Items = 22; Visible = 22 },
+        @{ Items = 23; Visible = 23 }, @{ Items = 24; Visible = 23 },
+        @{ Items = 500; Visible = 23 }
+    ) {
+        param($Items, $Visible)
+        InModuleScope Ctx -Parameters @{ Items = $Items; Visible = $Visible } {
+            param($Items, $Visible)
+            $frame = New-CtxMenuFrame -Rows @(1..$Items | ForEach-Object { "subscription-$_" }) -Selected 0 -Width 79 -Height 25 -Footer 'controls'
+            $frame.Count | Should -Be $Visible
+            $frame.Start | Should -Be 0
+            @($frame.Text -split "`n").Count | Should -Be ($Visible + 1)
+            $frame.Text | Should -Not -Match "`n$"
+        }
+    }
+
+    It 'keeps every subscription visible while scrolling down and back up' {
+        InModuleScope Ctx {
+            $rows = @(0..499 | ForEach-Object { "subscription-{0:000}" -f $_ })
+            $start = 0
+            foreach ($selected in (@(0..499) + @(499..0))) {
+                $frame = New-CtxMenuFrame -Rows $rows -Selected $selected -Start $start -Width 79 -Height 25 -Footer 'controls'
+                $frame.Count | Should -Be 23
+                $selected | Should -BeGreaterOrEqual $frame.Start
+                $selected | Should -BeLessThan ($frame.Start + $frame.Count)
+                $frame.Text | Should -Match ("›.*" + $rows[$selected])
+                @($frame.Text -split "`n").Count | Should -Be 24
+                $start = $frame.Start
+            }
+            $start | Should -Be 0
+        }
+    }
+
+    It 'follows a distant default, Home, End and wrapped selections' {
+        InModuleScope Ctx {
+            $rows = @(0..499 | ForEach-Object { "subscription-$_" })
+            $frame = New-CtxMenuFrame -Rows $rows -Selected 450 -Width 79 -Height 25
+            $frame.Start | Should -Be 428
+            $frame = New-CtxMenuFrame -Rows $rows -Selected 499 -Start $frame.Start -Width 79 -Height 25
+            $frame.Start | Should -Be 477
+            $frame = New-CtxMenuFrame -Rows $rows -Selected 0 -Start $frame.Start -Width 79 -Height 25
+            $frame.Start | Should -Be 0
+            $frame = New-CtxMenuFrame -Rows $rows -Selected 499 -Start $frame.Start -Width 79 -Height 25
+            $frame.Start | Should -Be 477
+        }
+    }
+
+    It 'adapts the viewport when the terminal shrinks and grows' {
+        InModuleScope Ctx {
+            $rows = @(0..499 | ForEach-Object { "subscription-$_" })
+            $frame = New-CtxMenuFrame -Rows $rows -Selected 499 -Width 79 -Height 25
+            $frame = New-CtxMenuFrame -Rows $rows -Selected 499 -Start $frame.Start -Width 39 -Height 10
+            $frame.Start | Should -Be 492
+            $frame.Count | Should -Be 8
+            $frame = New-CtxMenuFrame -Rows $rows -Selected 499 -Start $frame.Start -Width 119 -Height 40
+            $frame.Start | Should -Be 462
+            $frame.Count | Should -Be 38
+        }
+    }
+
+    It 'prevents long rows and controls from wrapping in narrow terminals' -TestCases @(
+        @{ Width = 1 }, @{ Width = 2 }, @{ Width = 10 }, @{ Width = 39 }
+    ) {
+        param($Width)
+        InModuleScope Ctx -Parameters @{ Width = $Width } {
+            param($Width)
+            $frame = New-CtxMenuFrame -Rows @('first subscription', ("a`tvery`nlong`rsubscription" * 10)) -Selected 1 -Width $Width -Height 3 -Footer ('controls ' * 20) -Colors @('Red', 'Green')
+            $frame.Start | Should -Be 1
+            $frame.Count | Should -Be 1
+            $plain = $frame.Text -replace "$([char]27)\[[0-9;]*[mKJ]", '' -replace "`r", ''
+            $lines = @($plain -split "`n")
+            $lines.Count | Should -Be 2
+            foreach ($line in $lines) { $line.Length | Should -BeLessOrEqual $Width }
+            if ($Width -gt 1) { $frame.Text | Should -Match ([regex]::Escape((Get-CtxAnsi Green))) }
+        }
+    }
+}
+
 Describe 'PIM and Graph helpers' {
     It 'classifies PIM errors' -TestCases @(
         @{ Message = 'RoleAssignmentRequestPolicyValidationFailed: ExpirationRule'; Kind = 'Expiration' }

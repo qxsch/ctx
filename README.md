@@ -68,7 +68,7 @@ cd ctx
 | `ctx graph -AddScopes "Scope1,Scope2"` | Add permissions to this terminal's session; try silent consent reuse first |
 | `ctx graph -Relogin` | Explicitly request a fresh device-code sign-in |
 | `ctx st [-Check]` | Status of this terminal (`-Check` verifies the tokens) |
-| `ctx sub [name]` | Pick a subscription (CLI + Az); remembered per environment |
+| `ctx sub [name]` | Pick a subscription (CLI + Az); remembered per environment. Long lists scroll in a terminal-sized window (↑/↓, Home/End) |
 | `ctx portal [azure\|entra\|pim\|intune\|security\|...]` | Open a portal in the environment's own browser profile (`-InPrivate`) |
 | `ctx exec <names\|all> { ... }` | Run a script block in several environments, `$_` = environment; the terminal is restored afterwards. Production environments ask for a typed confirmation first (`-Force` skips it) |
 | `ctx doctor [-Deep]` | Check prerequisites, profile, variables and every login |
@@ -77,6 +77,8 @@ cd ctx
 | `ctx help` | Cheat sheet |
 
 Tab completion covers environment names, verbs, roles, portals, subscriptions, Graph profiles and config keys. All `Get-Help` topics are available (`Get-Help Switch-CtxEnvironment -Full`).
+
+Interactive pickers show at most the terminal height minus two item rows, reserving space for controls and a spare line. The window follows the selection and adapts to terminal resizing on the next keypress.
 
 ## How switching works
 
