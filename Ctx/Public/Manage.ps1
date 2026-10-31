@@ -40,6 +40,7 @@ function Get-CtxEnvironment {
             CliSubscription = if ($cliSub -and $cliSub.id -ine $e.tenantId) { $cliSub.name } else { $null }
             AzSubscription  = $e.azSubscriptionName
             GraphProfile    = $e.graphProfile
+            SaveGraphCredentials = [bool]$e.saveGraphCredentials
             Description     = $e.description
             Color           = Get-CtxEnvColor $e
             Prod            = Test-CtxProd $e
@@ -114,6 +115,7 @@ function Add-CtxEnvironment {
         graphProfile         = $null
         graphClientId        = $null
         adminOnSwitch        = $null
+        saveGraphCredentials = $false
         pim                  = [ordered]@{}
         activations          = @()
         activationsCheckedAt = $null
@@ -259,6 +261,7 @@ function Remove-CtxEnvironment {
         if ($s.previous -eq $removedName) { $s.previous = $null }
     }
     if ($wasGlobal) { Reset-CtxCliEnvironment -User }
+    Remove-CtxGraphCredentials -Name $removedName
     if ($script:ProcessEnvName -eq $removedName) {
         Reset-CtxCliEnvironment -Process
         $script:ProcessEnvName = $null
@@ -337,6 +340,7 @@ function Rename-CtxEnvironment {
     if ($state.current -eq $new -and (Test-CtxTool $entry 'cli')) {
         Set-CtxUserEnv 'AZURE_CONFIG_DIR' $newDir
     }
+    Move-CtxGraphCredentials -OldName $oldName -NewName $new
     if ($script:ProcessEnvName -eq $oldName) {
         $script:ProcessEnvName = $new
         Set-CtxProcessCliVariables $state (Find-CtxEnvironment $state $new)
@@ -357,11 +361,19 @@ function Set-CtxEnvironment {
     Ask = offer PIM + Graph after switching, Always = do it automatically, Never = don't ask, Default = use config.
     .PARAMETER GraphProfile
     Graph scope profile: Admin, ReadOnly, Pim, a custom profile from config, or a scope list. 'Default' clears it.
+    .PARAMETER SaveGraphCredentials
+    On = keep this environment's Microsoft Graph refresh token (encrypted for your Windows user, on this device) and
+    restore it on the next Graph connect (ctx <name> -Admin, ctx pim, ctx graph) instead of asking for a device code.
+    Restoring stops graphMaxSessionHours (default 8) after the original sign-in. Off (the default) deletes the saved credentials.
     .EXAMPLE
     ctx set germany -AddTag prod -Color Red
     .EXAMPLE
     ctx set emea -PimHours 2 -AdminOnSwitch Always
+    .EXAMPLE
+    ctx set emea -SaveGraphCredentials On
     #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', 'SaveGraphCredentials',
+        Justification = 'An On/Off setting, not a secret.')]
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Position = 0)]
@@ -378,7 +390,8 @@ function Set-CtxEnvironment {
         [ValidateRange(0.5, 24)][double]$PimHours,
         [string]$PimReason,
         [string]$TicketSystem,
-        [ValidateSet('Ask', 'Always', 'Never', 'Default')][string]$AdminOnSwitch
+        [ValidateSet('Ask', 'Always', 'Never', 'Default')][string]$AdminOnSwitch,
+        [ValidateSet('On', 'Off')][string]$SaveGraphCredentials
     )
     $state = Read-CtxState
     $entry = if ($Name) { Resolve-CtxEnvironment $state $Name } else { Get-CtxProcessEnvironment }
@@ -406,6 +419,22 @@ function Set-CtxEnvironment {
         if ($bound.ContainsKey('PimReason')) { $e.pim.reason = ConvertTo-CtxSafeText $PimReason }
         if ($bound.ContainsKey('TicketSystem')) { $e.pim.ticketSystem = ConvertTo-CtxSafeText $TicketSystem }
         if ($bound.ContainsKey('AdminOnSwitch')) { $e.adminOnSwitch = if ($AdminOnSwitch -eq 'Default') { $null } else { $AdminOnSwitch.ToLowerInvariant() } }
+        if ($bound.ContainsKey('SaveGraphCredentials')) { $e.saveGraphCredentials = ($SaveGraphCredentials -eq 'On') }
+    }
+    if ($bound.ContainsKey('SaveGraphCredentials')) {
+        if ($SaveGraphCredentials -eq 'Off') {
+            Remove-CtxGraphCredentials -Name $targetName
+            Write-CtxMsg ok "Graph credentials of '$targetName' are not saved anymore (the saved copy is deleted)."
+        } else {
+            $t = $script:GraphToken
+            if ($t -and $script:GraphEnvName -eq $targetName -and $t.Source -eq 'DeviceCode' -and $t.RefreshToken) {
+                Save-CtxGraphCredentials -Entry $t.Entry -ClientId $t.ClientId -RefreshToken $t.RefreshToken -SessionStartedAt $t.SessionStartedAt
+                Write-CtxMsg ok "Graph credentials of '$targetName' are saved now."
+            } else {
+                Write-CtxMsg ok "Graph credentials of '$targetName' are saved at the next Graph sign-in."
+            }
+            Write-CtxMsg dim "ctx $targetName -Admin (also ctx pim, ctx graph) restores them without a device code, until graphMaxSessionHours after that sign-in."
+        }
     }
     if ($bound.ContainsKey('Tools') -and $targetName -eq $script:ProcessEnvName) {
         Write-CtxMsg dim "Tools changed - run 'ctx $targetName' to apply them."
@@ -522,6 +551,9 @@ function Import-CtxEnvironment {
             $new.activations = @()
             $new.created = if ($existing -and $existing.created) { $existing.created } else { ConvertTo-CtxIsoDate ([datetime]::UtcNow) }
             $new.lastUsed = if ($existing) { $existing.lastUsed } else { $null }
+            # Device-local opt-in: an export never switches credential saving on, and an overwrite keeps it only for the same login.
+            $new.saveGraphCredentials = [bool]($existing -and $existing.saveGraphCredentials -eq $true -and
+                $existing.tenantId -ieq $new.tenantId -and $existing.userObjectId -ieq $new.userObjectId)
             $entry = Repair-CtxEnvironmentEntry $new
             if ($existing) { $idx = $s.environments.IndexOf($existing); $s.environments[$idx] = $entry; & $note ok "updated '$n'" }
             else { $s.environments.Add($entry); & $note ok "added '$n'" }

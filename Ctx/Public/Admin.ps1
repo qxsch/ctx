@@ -3,7 +3,8 @@ function Invoke-CtxPim {
     .SYNOPSIS
     Activates a PIM role (default: Global Administrator) and prepares Microsoft Graph with the selected scope profile.
     .DESCRIPTION
-    1. Reuse a matching Graph/Az login, otherwise request PIM + the selected Graph scopes in one device-code sign-in.
+    1. Reuse a matching Graph session, the saved Graph credentials (ctx set <name> -SaveGraphCredentials On) or Az login,
+       otherwise request PIM + the selected Graph scopes in one device-code sign-in.
     2. Self-activation via Graph (justification / ticket / duration asked only when the policy needs it).
     3. Silently refresh after activation. Default Graph profile: Admin (focused Entra administration).
     Defaults (hours, reason, ticket system) are remembered per environment.
@@ -230,6 +231,10 @@ function Connect-CtxGraph {
     <#
     .SYNOPSIS
     Connects Microsoft Graph using cached credentials, silent refresh, or device code when necessary.
+    .DESCRIPTION
+    Order: the session of this terminal, then the Graph credentials saved for the environment (only with
+    ctx set <name> -SaveGraphCredentials On; valid for graphMaxSessionHours, default 8, after the original sign-in),
+    then the matching Az login, then a device code. A new sign-in is saved again when saving is on.
     .PARAMETER Scopes
     Scope profile (Admin, ReadOnly, Pim, custom from config) or a comma separated scope list. Default: the
     environment's profile, else config defaultGraphProfile (Admin). An explicit profile replaces session additions.
@@ -239,7 +244,7 @@ function Connect-CtxGraph {
     .PARAMETER Refresh
     Obtain a fresh token, silently when possible. Used after PIM activation.
     .PARAMETER Relogin
-    Skip cached credentials and explicitly sign in with device code.
+    Skip cached and saved credentials and explicitly sign in with device code (the new sign-in replaces saved credentials).
     .EXAMPLE
     ctx graph
     .EXAMPLE

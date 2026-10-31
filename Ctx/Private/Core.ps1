@@ -41,7 +41,7 @@ $script:CtxDefaultConfig = [ordered]@{
     browserPath          = ''
     prodTags             = @('prod', 'production')
     shareCliExtensions   = $true
-    graphMaxSessionHours = 12
+    graphMaxSessionHours = 8
     graphScopeProfiles   = [ordered]@{}
 }
 
@@ -63,7 +63,7 @@ $script:GraphEnvName = $null
 $script:GraphProfileName = $null
 $script:GraphToken = $null
 $script:GraphRenewalTimer = $null
-$script:StateCache = $null
+$script:GraphSaveWarned = $false
 $script:StateCacheStamp = $null
 $script:ConfigCache = $null
 $script:ConfigCacheStamp = $null
@@ -211,6 +211,7 @@ function Repair-CtxEnvironmentEntry {
         $Entry['graphProfile'] = $null
     }
     if ($Entry['pim'] -isnot [System.Collections.IDictionary]) { $Entry['pim'] = [ordered]@{} }
+    $Entry['saveGraphCredentials'] = ($Entry['saveGraphCredentials'] -eq $true)
     foreach ($k in 'role', 'reason', 'ticketSystem') {
         if ($null -ne $Entry['pim'][$k]) { $Entry['pim'][$k] = ConvertTo-CtxSafeText $Entry['pim'][$k] }
     }

@@ -1,6 +1,6 @@
 # Microsoft Graph: device-code sessions bound to this terminal, scope profiles Admin / ReadOnly / Pim / custom.
 # Cached tokens are reused before falling back to ctx's device-code flow (SDK issue #3495).
-# Graph refresh tokens stay in this process' memory.
+# Graph refresh tokens stay in this process' memory, unless the environment opts in to saved credentials (GraphStore.ps1).
 
 $script:CtxGraphClientId = '14d82eec-204b-4c2f-b7e8-296a70dab67e'   # Microsoft Graph Command Line Tools
 $script:CtxLoginHost = 'https://login.microsoftonline.com'
@@ -281,6 +281,9 @@ function Set-CtxGraphToken {
         $script:GraphToken.Account = [string]$context.Account
         $script:GraphToken.TokenClientId = [string]$context.ClientId
     }
+    if ($Source -eq 'DeviceCode' -and $Response.refresh_token -and (Test-CtxGraphCredentialsEnabled $Entry.name)) {
+        Save-CtxGraphCredentials -Entry $Entry -ClientId $ClientId -RefreshToken ([string]$Response.refresh_token) -SessionStartedAt $script:GraphToken.SessionStartedAt
+    }
 }
 
 function Update-CtxGraphToken {
@@ -313,6 +316,7 @@ function Update-CtxGraphToken {
         try {
             if ($maxHours -gt 0 -and $t.SessionStartedAt -and $now -ge ([datetime]$t.SessionStartedAt).AddHours($maxHours)) {
                 # Bounded sessions: an idle terminal must not keep privileged Graph access alive indefinitely.
+                if ($t.RefreshToken -and $t.Entry) { Remove-CtxGraphCredentials -Name $t.Entry.name -RefreshToken $t.RefreshToken }
                 $t.RefreshToken = $null
                 $r = [pscustomobject]@{ error = 'login_required'; error_description = "The Graph session reached graphMaxSessionHours ($maxHours h) and is no longer renewed." }
             } elseif ($t.Source -eq 'Az') {
@@ -346,7 +350,10 @@ function Update-CtxGraphToken {
         }
         $t.RetryAfter = $now.AddMinutes(2)
         # A consent failure for added scopes does not invalidate the original session's refresh token.
-        if ($r.error -eq 'invalid_grant' -and $scope -eq $t.Scope) { $t.RefreshToken = $null }
+        if ($r.error -eq 'invalid_grant' -and $scope -eq $t.Scope) {
+            if ($t.RefreshToken -and $t.Entry) { Remove-CtxGraphCredentials -Name $t.Entry.name -RefreshToken $t.RefreshToken }
+            $t.RefreshToken = $null
+        }
         $t.LastError = Get-CtxOAuthErrorText $r
         $t.ErrorCode = [string]$r.error
     }
@@ -402,6 +409,9 @@ function Connect-CtxGraphSession {
                 if (-not $ready) { Write-CtxMsg dim "Microsoft Graph needs device authentication: $($t.LastError)" }
             }
         }
+    }
+    if (-not $ready -and -not $Relogin) {
+        $ready = Restore-CtxGraphCredentials -Entry $Entry -ClientId $clientId -Scope $scope
     }
     if (-not $ready -and -not $Refresh -and -not $Relogin -and -not $Entry.graphClientId) {
         try {

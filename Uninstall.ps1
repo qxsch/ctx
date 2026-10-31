@@ -8,7 +8,8 @@ The profile block and the module folder sync via OneDrive, so removing them affe
 and the data folder are per device: other devices keep their AZURE_CONFIG_DIR user variable (az keeps working with
 the last environment) until you reset it there.
 .PARAMETER RemoveData
-Also delete the ctx data folder of this device (CLI logins of all environments, state, config) and the ctx:* Az
+Also delete the ctx data folder of this device (CLI logins of all environments, saved Graph credentials, state, config)
+and the ctx:* Az
 PowerShell contexts. Browser profiles (Edge 'ctx-<name>') are listed but not deleted. The folder is only deleted when
 it contains nothing but ctx data and is not a protected folder (drive root, profile, Documents, OneDrive, ...).
 .PARAMETER KeepModule
@@ -32,7 +33,7 @@ function Get-DataFolderProblem([string]$Path) {
         if ($full -ieq $p -or $p.StartsWith("$full\", [StringComparison]::OrdinalIgnoreCase)) { return "$full is or contains a protected folder ($p)" }
     }
     $items = @(Get-ChildItem -LiteralPath $full -Force)
-    $foreign = @($items | Where-Object { $_.Name -notmatch '^((environments|config|graph-permissions)\.json(\.bak|\.tmp)?|userenv\.json|cli)$' })
+    $foreign = @($items | Where-Object { $_.Name -notmatch '^((environments|config|graph-permissions)\.json(\.bak|\.tmp)?|userenv\.json|cli|graph)$' })
     if ($foreign.Count) { return "$full contains files ctx did not create ($(($foreign | Select-Object -First 5 | ForEach-Object Name) -join ', '))" }
     $null
 }

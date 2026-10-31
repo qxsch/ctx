@@ -10,7 +10,8 @@ function Switch-CtxEnvironment {
     .PARAMETER Name
     Environment name, a unique prefix of it, or '-' for the previous environment. Omit to get a picker.
     .PARAMETER Admin
-    Activate the PIM role and connect Microsoft Graph right away.
+    Activate the PIM role and connect Microsoft Graph right away. With ctx set <name> -SaveGraphCredentials On the
+    saved Graph sign-in is restored instead of asking for a device code (for graphMaxSessionHours, default 8).
     .PARAMETER NoAdmin
     Do not ask about PIM / Graph.
     .PARAMETER Local

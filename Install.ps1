@@ -12,7 +12,9 @@ Installs ctx for the current user: module and profile sync via OneDrive, logins 
   CurrentUser installs would land in OneDrive and shadow newer machine-wide versions on every device.
 - enables Az PowerShell context autosave for the current user (ctx also does this on first use on other devices)
 Device-local (never synced): %LOCALAPPDATA%\ctx (environments, CLI logins, config), ~\.Azure (Az contexts),
-browser profiles and the AZURE_CONFIG_DIR user variable. Graph tokens live only in each terminal's memory.
+browser profiles and the AZURE_CONFIG_DIR user variable. Graph tokens live only in each terminal's memory, unless you
+opt in per environment (ctx set <name> -SaveGraphCredentials On): then the refresh token is also stored encrypted
+(DPAPI, current user) in %LOCALAPPDATA%\ctx\graph.
 .PARAMETER ModulePath
 Modules folder to install into. Default: the user module folder in Documents (first PSModulePath entry there).
 .PARAMETER ProfilePath

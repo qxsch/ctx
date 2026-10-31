@@ -1,6 +1,6 @@
 @{
     RootModule           = 'Ctx.psm1'
-    ModuleVersion        = '1.2.0'
+    ModuleVersion        = '1.3.0'
     GUID                 = '6f0b8a52-3c1e-4d3b-9a47-2f5c8e1d7b90'
     Author               = 'qxsch'
     Copyright            = '(c) qxsch. MIT License.'
@@ -26,6 +26,12 @@
             ProjectUri   = 'https://github.com/qxsch/ctx'
             LicenseUri   = 'https://github.com/qxsch/ctx/blob/main/LICENSE'
             ReleaseNotes = @'
+1.3.0
+- New, opt-in per environment: 'ctx set <name> -SaveGraphCredentials On' keeps the Graph refresh token (DPAPI-encrypted,
+  current user, this device) and restores it on 'ctx <name> -Admin', 'ctx pim' and 'ctx graph' instead of a device code.
+  Still bounded by graphMaxSessionHours; never exported or synced; 'Off', 'ctx rm' and Uninstall.ps1 -RemoveData delete it.
+- The default of graphMaxSessionHours is now 8 (was 12).
+
 1.2.0
 - Removed the 'All' Graph scope profile: requesting every delegated permission violates least privilege and Entra
   rejects it. Its fallback machinery is gone too (setting fallbackGraphProfile, Connect-CtxGraph -NoFallback). A stored

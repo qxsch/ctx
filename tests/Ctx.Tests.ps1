@@ -954,6 +954,317 @@ Describe 'PIM and Graph login reuse' {
     }
 }
 
+Describe 'Saved Graph credentials' {
+    BeforeAll {
+        Mock -ModuleName Ctx Write-Host { }
+        Mock -ModuleName Ctx Start-Sleep { }
+        Mock -ModuleName Ctx Show-CtxDeviceCode { }
+        Mock -ModuleName Ctx Import-CtxGraphModule { }
+        Mock -ModuleName Ctx Get-CtxAzGraphToken { }
+        Mock -ModuleName Ctx Connect-CtxGraphToken { }
+        Mock -ModuleName Ctx Start-CtxGraphRenewal { }
+        Mock -ModuleName Ctx Stop-CtxGraphRenewal { }
+        Mock -ModuleName Ctx Get-CtxMgContext {
+            InModuleScope Ctx {
+                if ($script:GraphToken) {
+                    [pscustomobject]@{
+                        AuthType = 'UserProvidedAccessToken'; TenantId = $script:GraphToken.TenantId
+                        Account = $script:GraphToken.Account; ClientId = $script:GraphToken.TokenClientId; Scopes = $script:GraphToken.Scopes
+                    }
+                }
+            }
+        }
+        $script:savedDir = Join-Path $testHome 'graph'
+        $script:savedPath = Join-Path $savedDir 'flow.dat'
+        $script:graphAppId = '14d82eec-204b-4c2f-b7e8-296a70dab67e'
+        $script:dailyScopes = @(InModuleScope Ctx { Get-CtxGraphScopes Admin })
+        $script:flowRole = [pscustomobject]@{
+            RoleId = '62e90394-69f5-4237-9190-012177145e10'; RoleName = 'Global Administrator'
+            Scope = '/'; End = [datetime]::UtcNow.AddHours(2); AssignmentType = 'Activated'
+        }
+        function New-SavedFlowToken([string]$RefreshToken) {
+            [pscustomobject]@{
+                access_token = New-TestJwt @{
+                    aud = 'https://graph.microsoft.com'; tid = $T1; oid = $O1; upn = 'flow@contoso.com'
+                    appid = $graphAppId; scp = $dailyScopes -join ' '; exp = [DateTimeOffset]::UtcNow.AddHours(1).ToUnixTimeSeconds()
+                }
+                refresh_token = $RefreshToken
+            }
+        }
+        function Reset-FlowTerminal { InModuleScope Ctx { $script:GraphToken = $null; $script:GraphEnvName = $null; $script:GraphProfileName = $null } }
+        function Enable-FlowSaving { $null = Set-CtxEnvironment -Name flow -SaveGraphCredentials On }
+        function Read-FlowSaved { InModuleScope Ctx { (Read-CtxGraphCredentialFile 'flow')['refreshToken'] } }
+    }
+    BeforeEach {
+        Set-TestState -Current 'flow' -Environments @((New-TestEnv 'flow' $T1 $O1))
+        Remove-Item -LiteralPath $savedDir -Recurse -Force -ErrorAction SilentlyContinue
+        $script:deviceToken = New-SavedFlowToken 'rt-device'
+        $script:refreshResponse = New-SavedFlowToken 'rt-renewed'
+        Mock -ModuleName Ctx Get-CtxPimActiveRoles { @() }
+        Mock -ModuleName Ctx Request-CtxPimActivation { $flowRole }
+        Mock -ModuleName Ctx Invoke-CtxOAuth {
+            [pscustomobject]@{ device_code = 'dc'; user_code = 'SAVED123'; verification_uri = 'https://login.microsoft.com/device'; interval = 5; expires_in = 900 }
+        } -ParameterFilter { $Endpoint -eq 'devicecode' }
+        Mock -ModuleName Ctx Invoke-CtxOAuth { $deviceToken } -ParameterFilter { $Endpoint -eq 'token' -and $Body.grant_type -like '*device_code' }
+        Mock -ModuleName Ctx Invoke-CtxOAuth { $refreshResponse } -ParameterFilter { $Endpoint -eq 'token' -and $Body.grant_type -eq 'refresh_token' }
+    }
+    AfterEach {
+        Reset-FlowTerminal
+        Remove-Item -LiteralPath $savedDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'is off by default and writes nothing' {
+        (Get-CtxEnvironment -Name flow).SaveGraphCredentials | Should -BeFalse
+        Connect-CtxGraph
+        Test-Path -LiteralPath $savedPath | Should -BeFalse
+        Reset-FlowTerminal
+        Connect-CtxGraph
+        Should -Invoke Invoke-CtxOAuth -ModuleName Ctx -Times 2 -Exactly -ParameterFilter { $Endpoint -eq 'devicecode' }
+        Should -Invoke Invoke-CtxOAuth -ModuleName Ctx -Times 0 -Exactly -ParameterFilter { $Endpoint -eq 'token' -and $Body.grant_type -eq 'refresh_token' }
+    }
+
+    It 'saves only the encrypted refresh token after the next sign-in once enabled' {
+        Enable-FlowSaving
+        (Get-TestState).environments[0].saveGraphCredentials | Should -BeTrue
+        (Get-CtxEnvironment -Name flow).SaveGraphCredentials | Should -BeTrue
+        Connect-CtxGraph
+        Test-Path -LiteralPath $savedPath | Should -BeTrue
+        $raw = Get-Content -LiteralPath $savedPath -Raw
+        $raw | Should -Not -BeLike '*rt-device*'
+        $raw | Should -Not -BeLike '*access_token*'
+        $raw | Should -Not -BeLike '*{*'
+        Read-FlowSaved | Should -Be 'rt-device'
+        InModuleScope Ctx {
+            $saved = Read-CtxGraphCredentialFile 'flow'
+            $saved.Keys | Sort-Object | Should -Be @('clientId', 'refreshToken', 'savedAt', 'sessionStartedAt', 'tenantId', 'userObjectId', 'version')
+        }
+    }
+
+    It 'saves the live session right away when enabled while Graph is connected' {
+        Connect-CtxGraph
+        Test-Path -LiteralPath $savedPath | Should -BeFalse
+        Enable-FlowSaving
+        Read-FlowSaved | Should -Be 'rt-device'
+    }
+
+    It 'restores Graph in a new terminal without a device code and keeps the original sign-in time' {
+        Enable-FlowSaving
+        Connect-CtxGraph
+        $started = InModuleScope Ctx { $script:GraphToken.SessionStartedAt }
+        Reset-FlowTerminal
+        Connect-CtxGraph
+        Should -Invoke Invoke-CtxOAuth -ModuleName Ctx -Times 1 -Exactly -ParameterFilter { $Endpoint -eq 'devicecode' }
+        Should -Invoke Invoke-CtxOAuth -ModuleName Ctx -Times 1 -Exactly -ParameterFilter {
+            $Endpoint -eq 'token' -and $Body.grant_type -eq 'refresh_token' -and $Body.refresh_token -eq 'rt-device' -and $Body.client_id -eq '14d82eec-204b-4c2f-b7e8-296a70dab67e'
+        }
+        InModuleScope Ctx {
+            $script:GraphEnvName | Should -Be 'flow'
+            $script:GraphToken.RefreshToken | Should -Be 'rt-renewed'
+            $script:GraphToken.Source | Should -Be 'DeviceCode'
+        }
+        $restored = InModuleScope Ctx { $script:GraphToken.SessionStartedAt }
+        [math]::Abs(($restored - $started).TotalSeconds) | Should -BeLessThan 2
+        Read-FlowSaved | Should -Be 'rt-renewed'
+    }
+
+    It 'restores for the admin switch (PIM role already active) without a device code' {
+        Enable-FlowSaving
+        Connect-CtxGraph
+        Reset-FlowTerminal
+        Mock -ModuleName Ctx Get-CtxPimActiveRoles { $flowRole }
+        InModuleScope Ctx { Invoke-CtxAdminOffer -Entry (Find-CtxEnvironment (Read-CtxState) 'flow') -Admin }
+        Should -Invoke Request-CtxPimActivation -ModuleName Ctx -Times 0 -Exactly
+        Should -Invoke Invoke-CtxOAuth -ModuleName Ctx -Times 1 -Exactly -ParameterFilter { $Endpoint -eq 'devicecode' }
+        InModuleScope Ctx { $script:GraphToken.RefreshToken | Should -Be 'rt-renewed' }
+    }
+
+    It 'restores for ctx pim before a new activation and refreshes after it' {
+        Enable-FlowSaving
+        Connect-CtxGraph
+        Reset-FlowTerminal
+        Invoke-CtxPim
+        Should -Invoke Request-CtxPimActivation -ModuleName Ctx -Times 1 -Exactly
+        Should -Invoke Invoke-CtxOAuth -ModuleName Ctx -Times 1 -Exactly -ParameterFilter { $Endpoint -eq 'devicecode' }
+        Should -Invoke Invoke-CtxOAuth -ModuleName Ctx -Times 2 -Exactly -ParameterFilter { $Endpoint -eq 'token' -and $Body.grant_type -eq 'refresh_token' }
+    }
+
+    It 'does not use the saved credentials with -Relogin and replaces them with the new sign-in' {
+        Enable-FlowSaving
+        Connect-CtxGraph
+        Reset-FlowTerminal
+        $script:deviceToken = New-SavedFlowToken 'rt-fresh'
+        Connect-CtxGraph -Relogin
+        Should -Invoke Invoke-CtxOAuth -ModuleName Ctx -Times 2 -Exactly -ParameterFilter { $Endpoint -eq 'devicecode' }
+        Should -Invoke Invoke-CtxOAuth -ModuleName Ctx -Times 0 -Exactly -ParameterFilter { $Endpoint -eq 'token' -and $Body.grant_type -eq 'refresh_token' }
+        Read-FlowSaved | Should -Be 'rt-fresh'
+    }
+
+    It 'falls back to a device code and saves the new sign-in when the saved token is rejected' {
+        Enable-FlowSaving
+        Connect-CtxGraph
+        Reset-FlowTerminal
+        $script:refreshResponse = [pscustomobject]@{ error = 'invalid_grant'; error_description = 'AADSTS70043: The refresh token has expired. Trace ID: 1' }
+        $script:deviceToken = New-SavedFlowToken 'rt-after-fallback'
+        Connect-CtxGraph
+        Should -Invoke Invoke-CtxOAuth -ModuleName Ctx -Times 2 -Exactly -ParameterFilter { $Endpoint -eq 'devicecode' }
+        Read-FlowSaved | Should -Be 'rt-after-fallback'
+    }
+
+    It 'falls back to a device code on a network error and keeps the saved token' {
+        Enable-FlowSaving
+        Connect-CtxGraph
+        Reset-FlowTerminal
+        Mock -ModuleName Ctx Invoke-CtxOAuth { throw 'Network is unavailable.' } -ParameterFilter { $Endpoint -eq 'token' -and $Body.grant_type -eq 'refresh_token' }
+        $script:deviceToken = New-SavedFlowToken 'rt-after-network'
+        Connect-CtxGraph
+        Should -Invoke Invoke-CtxOAuth -ModuleName Ctx -Times 2 -Exactly -ParameterFilter { $Endpoint -eq 'devicecode' }
+    }
+
+    It 'never restores past graphMaxSessionHours and deletes the expired file' {
+        Enable-FlowSaving
+        InModuleScope Ctx -Parameters @{ App = $graphAppId } {
+            param($App)
+            Save-CtxGraphCredentials -Entry (Find-CtxEnvironment (Read-CtxState) 'flow') -ClientId $App -RefreshToken 'rt-old' -SessionStartedAt ([datetime]::UtcNow.AddHours(-9))
+        }
+        Read-FlowSaved | Should -Be 'rt-old'
+        (InModuleScope Ctx { Get-CtxGraphCredentialInfo (Find-CtxEnvironment (Read-CtxState) 'flow') }).Expired | Should -BeTrue
+        Connect-CtxGraph
+        Should -Invoke Invoke-CtxOAuth -ModuleName Ctx -Times 0 -Exactly -ParameterFilter { $Body.refresh_token -eq 'rt-old' }
+        Should -Invoke Invoke-CtxOAuth -ModuleName Ctx -Times 1 -Exactly -ParameterFilter { $Endpoint -eq 'devicecode' }
+        Read-FlowSaved | Should -Be 'rt-device'
+    }
+
+    It 'ignores credentials saved for another login or Graph client' -TestCases @(
+        @{ Case = 'login'; ObjectId = 'aaaaaaaa-0000-0000-0000-0000000000ff'; Client = '14d82eec-204b-4c2f-b7e8-296a70dab67e' }
+        @{ Case = 'client'; ObjectId = 'aaaaaaaa-0000-0000-0000-000000000001'; Client = '00000000-0000-0000-0000-000000000abc' }
+    ) {
+        param($Case, $ObjectId, $Client)
+        Enable-FlowSaving
+        InModuleScope Ctx -Parameters @{ O = $ObjectId; C = $Client } {
+            param($O, $C)
+            $entry = Find-CtxEnvironment (Read-CtxState) 'flow'
+            $other = @{ name = 'flow'; tenantId = $entry.tenantId; userObjectId = $O }
+            Save-CtxGraphCredentials -Entry $other -ClientId $C -RefreshToken 'rt-foreign' -SessionStartedAt ([datetime]::UtcNow)
+            Get-CtxSavedGraphCredentials -Entry $entry -ClientId '14d82eec-204b-4c2f-b7e8-296a70dab67e' | Should -BeNullOrEmpty
+        }
+        Test-Path -LiteralPath $savedPath | Should -BeFalse
+    }
+
+    It 'treats an unreadable file as nothing saved' {
+        Enable-FlowSaving
+        New-Item -ItemType Directory -Path $savedDir -Force | Out-Null
+        Set-Content -LiteralPath $savedPath -Value 'not a protected blob'
+        Connect-CtxGraph
+        Should -Invoke Invoke-CtxOAuth -ModuleName Ctx -Times 1 -Exactly -ParameterFilter { $Endpoint -eq 'devicecode' }
+        Read-FlowSaved | Should -Be 'rt-device'
+    }
+
+    It 'deletes the saved file with Off and does not restore without the setting' {
+        Enable-FlowSaving
+        Connect-CtxGraph
+        Test-Path -LiteralPath $savedPath | Should -BeTrue
+        $null = Set-CtxEnvironment -Name flow -SaveGraphCredentials Off
+        Test-Path -LiteralPath $savedPath | Should -BeFalse
+        (Get-TestState).environments[0].saveGraphCredentials | Should -BeFalse
+        InModuleScope Ctx { Save-CtxGraphCredentials -Entry (Find-CtxEnvironment (Read-CtxState) 'flow') -ClientId '14d82eec-204b-4c2f-b7e8-296a70dab67e' -RefreshToken 'rt-left-over' -SessionStartedAt ([datetime]::UtcNow) }
+        Reset-FlowTerminal
+        Connect-CtxGraph
+        Should -Invoke Invoke-CtxOAuth -ModuleName Ctx -Times 0 -Exactly -ParameterFilter { $Body.refresh_token -eq 'rt-left-over' }
+    }
+
+    It 'deletes the saved file when the renewal finds the refresh token revoked' {
+        Enable-FlowSaving
+        Connect-CtxGraph
+        Test-Path -LiteralPath $savedPath | Should -BeTrue
+        $script:refreshResponse = [pscustomobject]@{ error = 'invalid_grant'; error_description = 'AADSTS50173: The grant is revoked.' }
+        InModuleScope Ctx {
+            $script:GraphToken.ExpiresAt = [datetime]::UtcNow.AddMinutes(-1)
+            [void](Update-CtxGraphToken -Quiet)
+        }
+        Test-Path -LiteralPath $savedPath | Should -BeFalse
+    }
+
+    It 'keeps a newer token saved by another terminal when this session ends' {
+        Enable-FlowSaving
+        Connect-CtxGraph
+        InModuleScope Ctx { Save-CtxGraphCredentials -Entry (Find-CtxEnvironment (Read-CtxState) 'flow') -ClientId '14d82eec-204b-4c2f-b7e8-296a70dab67e' -RefreshToken 'rt-other-terminal' -SessionStartedAt ([datetime]::UtcNow) }
+        $script:refreshResponse = [pscustomobject]@{ error = 'invalid_grant'; error_description = 'AADSTS50173: The grant is revoked.' }
+        InModuleScope Ctx {
+            $script:GraphToken.ExpiresAt = [datetime]::UtcNow.AddMinutes(-1)
+            [void](Update-CtxGraphToken -Quiet)
+        }
+        Read-FlowSaved | Should -Be 'rt-other-terminal'
+    }
+
+    It 'follows a rename and is deleted with the environment' {
+        Set-TestState -Current 'flow' -Environments @((New-TestEnv 'flow' $T1 $O1 -Tools @('cli')))
+        Enable-FlowSaving
+        InModuleScope Ctx { Save-CtxGraphCredentials -Entry (Find-CtxEnvironment (Read-CtxState) 'flow') -ClientId '14d82eec-204b-4c2f-b7e8-296a70dab67e' -RefreshToken 'rt-move' -SessionStartedAt ([datetime]::UtcNow) }
+        Rename-CtxEnvironment flow flow2
+        Test-Path -LiteralPath $savedPath | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $savedDir 'flow2.dat') | Should -BeTrue
+        (Get-TestState).environments[0].saveGraphCredentials | Should -BeTrue
+        Remove-CtxEnvironment flow2 -Force
+        Test-Path -LiteralPath (Join-Path $savedDir 'flow2.dat') | Should -BeFalse
+    }
+
+    It 'is never exported, and an import cannot switch it on' {
+        Enable-FlowSaving
+        $file = Join-Path $testHome 'saved-graph-export.json'
+        Export-CtxEnvironment $file
+        Get-Content -LiteralPath $file -Raw | Should -Not -BeLike '*aveGraphCredentials*'
+
+        $doc = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json -AsHashtable
+        $copy = $doc.environments[0].Clone()
+        $copy.name = 'flow-copy'; $copy.tenantId = $T2; $copy.userObjectId = $O2; $copy.saveGraphCredentials = $true
+        $doc.environments = @($copy)
+        $doc | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $file
+        Import-CtxEnvironment $file
+        $imported = (Get-TestState).environments | Where-Object name -EQ 'flow-copy'
+        $imported | Should -Not -BeNullOrEmpty
+        $imported.saveGraphCredentials | Should -BeFalse
+
+        # Overwriting the same login keeps the local opt-in; it is not part of the file.
+        Export-CtxEnvironment $file -Name flow
+        Import-CtxEnvironment $file -Force
+        ((Get-TestState).environments | Where-Object name -EQ 'flow').saveGraphCredentials | Should -BeTrue
+    }
+
+    It 'only builds credential paths for safe environment names' {
+        { InModuleScope Ctx { Get-CtxGraphCredentialPath '..\evil' } } | Should -Throw '*Invalid environment name*'
+        { InModuleScope Ctx { Get-CtxGraphCredentialPath 'a\b' } } | Should -Throw '*Invalid environment name*'
+        InModuleScope Ctx { Get-CtxGraphCredentialPath 'flow' } | Should -Be (Join-Path $savedDir 'flow.dat')
+    }
+
+    It 'shows the state in ctx st' {
+        Set-TestState -Current 'flow' -Environments @((New-TestEnv 'flow' $T1 $O1 -Tools @('cli')))
+        Mock -ModuleName Ctx Write-Host { }
+        Get-CtxStatus
+        Should -Invoke Write-Host -ModuleName Ctx -Times 0 -Exactly -ParameterFilter { "$Object" -like '*Saved Graph*' -or "$Object" -like 'on · *' }
+        Enable-FlowSaving
+        Get-CtxStatus
+        Should -Invoke Write-Host -ModuleName Ctx -Times 1 -Exactly -ParameterFilter { "$Object" -like 'on · nothing saved yet*' }
+        Connect-CtxGraph
+        Get-CtxStatus
+        Should -Invoke Write-Host -ModuleName Ctx -Times 1 -Exactly -ParameterFilter { "$Object" -like 'on · saved just now, restorable until *' }
+    }
+
+    It 'doctor reports saved credentials and orphaned files' {
+        Set-TestState -Current 'flow' -Environments @((New-TestEnv 'flow' $T1 $O1 -Tools @('cli')))
+        Mock -ModuleName Ctx Get-CtxAzCliPath { $null }
+        Mock -ModuleName Ctx Test-CtxAzAvailable { $false }
+        Enable-FlowSaving
+        Connect-CtxGraph
+        New-Item -ItemType Directory -Path $savedDir -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $savedDir 'ghost.dat') -Value 'x'
+        $r = Test-CtxSetup -PassThru
+        ($r | Where-Object Area -EQ 'flow · graph').Status | Should -Be 'ok'
+        ($r | Where-Object Area -EQ 'flow · graph').Detail | Should -BeLike 'saved credentials, restorable until *'
+        @($r | Where-Object Area -EQ 'Saved Graph credentials').Detail | Should -BeLike '*ghost.dat*'
+        @($r | Where-Object Area -EQ 'Saved Graph credentials').Count | Should -Be 1
+    }
+}
+
 Describe 'Configuration' {
     It 'converts values by the type of the default' {
         InModuleScope Ctx {
@@ -1486,6 +1797,17 @@ Describe 'Uninstall safety' {
         $out | Should -BeLike '*Data folder not deleted*'
         $out | Should -Not -BeLike '*Delete ctx data folder*'
         if ($Case -ne 'home') { Test-Path -LiteralPath (Join-Path $dir 'important.docx') | Should -BeTrue }
+    }
+    It 'treats the saved Graph credentials folder as ctx data' {
+        $d = Join-Path $testHome 'uninstall-graph'
+        New-Item -ItemType Directory -Path (Join-Path $d 'graph') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $d 'graph\flow.dat') -Value 'x'
+        Set-Content -LiteralPath (Join-Path $d 'config.json') -Value '{}'
+        $script = Join-Path $repoRoot 'Uninstall.ps1'
+        $out = pwsh -NoProfile -NonInteractive -Command "`$env:CTX_HOME = '$($d.Replace("'", "''"))'; `$env:PSModulePath = `$env:PSModulePath -split ';' | Where-Object { `$_ -notmatch 'OneDrive|Documents' } | Join-String -Separator ';'; & '$($script.Replace("'", "''"))' -RemoveData -KeepModule -WhatIf *>&1" | Out-String
+        $out | Should -Not -BeLike '*Data folder not deleted*'
+        $out | Should -BeLike '*Delete ctx data folder*'
+        Test-Path -LiteralPath (Join-Path $d 'graph\flow.dat') | Should -BeTrue
     }
 }
 

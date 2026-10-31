@@ -27,7 +27,7 @@ cd ctx
 |---|---|
 | Module: `Documents\PowerShell\Modules\Ctx` | Environments, state, settings, CLI logins: `%LOCALAPPDATA%\ctx` |
 | Profile: `Documents\PowerShell\profile.ps1` (ctx block) | Az PowerShell contexts: `~\.Azure` |
-| | Graph tokens: memory of each terminal only |
+| | Graph tokens: memory of each terminal (plus an encrypted file, only for environments with `-SaveGraphCredentials On`) |
 | | Browser profiles, the `AZURE_CONFIG_DIR` / `AZURE_EXTENSION_DIR` user variables |
 
 - **Code:** this repo is the source. `Install.ps1` copies a bundled build (a single `Ctx.psm1`, which starts faster) into your user module folder. That folder lives in OneDrive when Documents is backed up by OneDrive.
@@ -61,7 +61,7 @@ cd ctx
 | `ctx list` / `ctx ls` | List environments (`*` = this terminal, `+` = global, PIM time left) |
 | `ctx rename <old> <new>` | Rename (CLI folder and Az context move along, the browser profile is kept) |
 | `ctx rm <name>` | Remove (`-SignOut` signs out of CLI/Az, `-RemoveBrowserProfile`, `-WhatIf`) |
-| `ctx set [name] ...` | `-AddTag/-RemoveTag/-Tags`, `-Color`, `-Description`, `-Tools`, `-PimRole`, `-PimHours`, `-PimReason`, `-TicketSystem`, `-GraphProfile`, `-GraphClientId`, `-AdminOnSwitch Ask/Always/Never/Default` |
+| `ctx set [name] ...` | `-AddTag/-RemoveTag/-Tags`, `-Color`, `-Description`, `-Tools`, `-PimRole`, `-PimHours`, `-PimReason`, `-TicketSystem`, `-GraphProfile`, `-GraphClientId`, `-AdminOnSwitch Ask/Always/Never/Default`, `-SaveGraphCredentials On/Off` |
 | `ctx pim [role]` | Activate a PIM role (default Global Administrator) + Graph; `-Hours -Reason -Ticket -NoGraph -Wait` |
 | `ctx pim -List` / `-Deactivate` / `-Renew` | Eligible/active roles, end an activation early, start a fresh one |
 | `ctx graph [profile]` | Reuse/renew Graph, or use device code if needed; `Admin`, `ReadOnly`, `Pim`, custom or `"Scope1,Scope2"` |
@@ -120,11 +120,28 @@ ctx gives the access token to the SDK with `Connect-MgGraph -AccessToken`, so ev
 - **Identity check:** the token's tenant and object ID are checked against the environment *before* the token is handed over. Signing in with the wrong account fails without connecting anything.
 - **Renewal:** ctx uses its in-memory refresh token (`offline_access`), or obtains another token from the same named Az context. It checks 15 minutes before expiry at the prompt, on Graph/PIM commands, and on a 4-minute timer while PowerShell can process events. Long-running commands can delay the timer.
   - If renewal fails, a one-time hint appears at the next prompt. `ctx graph` retries; network errors do not cause pointless new device logins.
-  - Renewal stops `graphMaxSessionHours` (default 12) after the sign-in, so an idle terminal does not keep privileged Graph access alive indefinitely. The last token stays valid until it expires; then `ctx graph` signs in again. `0` disables the limit.
+  - Renewal stops `graphMaxSessionHours` (default 8) after the sign-in, so an idle terminal does not keep privileged Graph access alive indefinitely. The last token stays valid until it expires; then `ctx graph` signs in again. `0` disables the limit.
   - `ctx status` shows how long the token is valid and until when it renews.
-- **Storage:** ctx's Graph refresh token stays only in terminal memory. Az manages its existing device-local token cache; ctx does not copy its refresh tokens. New terminals can reuse Az when its Graph permissions suffice; otherwise they need one Graph device login.
+- **Storage:** by default ctx's Graph refresh token stays only in terminal memory. Az manages its existing device-local token cache; ctx does not copy its refresh tokens. New terminals can reuse Az when its Graph permissions suffice; otherwise they need one Graph device login. To skip that login, opt in per environment: see [Saved Graph credentials](#saved-graph-credentials).
 - **Separate clients:** Azure CLI, Az PowerShell and Graph have different OAuth clients and token caches. A browser's portal session is not a shared PowerShell token cache, and Global Admin does not automatically grant every Graph OAuth scope.
 - If another account or client replaces the Graph connection, ctx stops renewing its old session.
+
+### Saved Graph credentials
+
+Off by default. Turn it on for the environments where you want to avoid a Graph device code in every new terminal:
+
+```powershell
+ctx set emea -SaveGraphCredentials On     # Off (default) stops saving and deletes the saved copy
+ctx emea -Admin                            # later, in any new terminal: Graph is restored silently, no device code
+```
+
+- **What is saved:** only the Graph refresh token and the time of the original sign-in, one file per environment: `%LOCALAPPDATA%\ctx\graph\<name>.dat`. Access tokens are never stored. The file is encrypted with Windows DPAPI for your user on this device, so it cannot be read by other users or on other devices, and it is never exported or synced (`ctx export` and `ctx import` ignore the setting).
+- **When it is saved:** after each Graph sign-in or token renewal in an opted-in environment. Turning the setting on while Graph is connected in this terminal saves that session right away.
+- **When it is restored:** whenever Graph is connected for the environment of the terminal: `ctx <name> -Admin` (also the picker's `a`, `AdminOnSwitch Always` and answering *yes*), `ctx pim` and `ctx graph`. A plain `ctx <name>` does not connect Graph, so nothing is restored. `ctx graph -Relogin` ignores the saved credentials and replaces them with the new sign-in.
+  - The saved token is exchanged for a new access token with the requested scopes and checked like any other sign-in (tenant, user, scopes). If that fails (expired, revoked, new consent or MFA needed), ctx falls back to the usual Az reuse or device code, and the new sign-in is saved.
+- **Still bounded:** restoring keeps the original sign-in time, so `graphMaxSessionHours` (default 8) applies across terminals and reboots. After that the saved file is deleted and the next sign-in needs one device code.
+- **Cleanup:** the file is deleted by `ctx set <name> -SaveGraphCredentials Off`, `ctx rm`, an expired or revoked refresh token and `Uninstall.ps1 -RemoveData`; `ctx rename` moves it. `ctx st` and `ctx doctor` show its state.
+- **Trade-off:** any process running as your Windows user can decrypt the file, as with the Az token cache. Leave it off for environments where that is not acceptable.
 
 ### Daily Graph scopes
 
@@ -189,7 +206,7 @@ The badge wraps your existing prompt. Load ctx after oh-my-posh/starship, or tur
 | `browserPath` | auto (Edge) | any Chromium browser, e.g. Chrome |
 | `prodTags` | `prod, production` | |
 | `shareCliExtensions` | `on` | one CLI extension folder for all environments |
-| `graphMaxSessionHours` | 12 | stop renewing a Graph session this many hours after its sign-in (`0` = no limit) |
+| `graphMaxSessionHours` | 8 | stop renewing a Graph session this many hours after its sign-in, also for saved credentials (`0` = no limit) |
 | `graphScopeProfiles.<name>` | | custom Graph scope profiles |
 
 ## Data
@@ -200,19 +217,21 @@ Everything persistent is stored locally on each device in `%LOCALAPPDATA%\ctx`, 
 - `config.json`: your setting overrides only.
 - `cli\<name>\`: Azure CLI config/token cache per environment.
 - `graph-permissions.json`: cache of the delegated Graph permission names.
+- `graph\<name>.dat`: DPAPI-encrypted Graph refresh token, only for environments with `-SaveGraphCredentials On`.
 
 Stored outside that folder:
 
 - The Az PowerShell contexts live in the normal Az profile (`~\.Azure\AzureRmContext.json`) and are named `ctx:<name>`.
 - The browser profiles are `ctx-<name>` profiles of Edge (or the configured browser) in its normal *User Data* folder.
 
-ctx stores no secrets itself. Azure CLI and Az tokens stay in their token caches. Graph tokens exist only in the memory of the terminal that signed in.
+ctx stores no secrets in plain text. Azure CLI and Az tokens stay in their token caches. Graph tokens exist only in the memory of the terminal that signed in, unless you opt in to [saved Graph credentials](#saved-graph-credentials) for an environment.
 
 ## Security
 
 - **Export files are untrusted input.** `ctx import` reads only the portable fields. Tenant, user, client and subscription IDs must be GUIDs, and the tenant domain must be a domain name; other entries are skipped. Terminal control characters are stripped. A custom `graphClientId` is dropped unless you confirm it or pass `-AllowGraphClientId`, because Graph sign-ins for that environment grant consent to that application. `ctx doctor` flags stored environments that fail these checks.
 - **No command or argument injection.** `az` is a batch file (`az.cmd`) whose command line cmd.exe parses again, so ctx refuses any `az` argument with cmd.exe metacharacters. Browsers get one argument per value with a canonical http(s) URL. Device-code pages are opened only on Microsoft sign-in hosts.
 - **Bounded Graph sessions.** See `graphMaxSessionHours`. The default `Admin` profile is powerful (application, role and authentication-method write access); use `ctx graph ReadOnly` when you only read.
+- **Saved Graph credentials are opt-in per environment.** The refresh token is DPAPI-encrypted for your user and device, bound to the environment's tenant, user and Graph client, bounded by `graphMaxSessionHours`, and never exported, imported or synced. An import file cannot switch the setting on.
 - **Synced code runs in admin terminals.** The module and profile sync via OneDrive and load in every terminal, including those that hold Global Administrator tokens. Anyone who can change files in your OneDrive can change that code. Mark of the Web does not apply to OneDrive-synced files, so `RemoteSigned` gives no protection here.
   - Sign the module: `.\Install.ps1 -SigningCertificate <thumbprint>`. `ctx doctor` then reports a changed module (`HashMismatch`). With the `AllSigned` execution policy, PowerShell refuses unsigned or changed code; your profile must then be signed too.
   - Or keep the code local: `.\Install.ps1 -ModulePath <folder outside OneDrive>`. Other devices then need their own install.

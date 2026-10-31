@@ -43,6 +43,15 @@ function Get-CtxStatus {
         } else { '' }
         "connected · $($script:GraphProfileName) · $(@($mg.Scopes).Count) scopes · $($mg.Account)$tokenText"
     } else { "not connected ('ctx graph' or 'ctx pim')" }
+    $savedGraphText = if ($entry.saveGraphCredentials -eq $true) {
+        $saved = Get-CtxGraphCredentialInfo $entry
+        if (-not $saved) { 'on · nothing saved yet (saved at the next Graph sign-in)' }
+        elseif ($saved.Expired) { 'on · expired - the next Graph sign-in saves new credentials' }
+        else {
+            "on · saved $(Format-CtxAgo $saved.SavedAt)" +
+            $(if ($saved.RestorableUntil) { ", restorable until $($saved.RestorableUntil.ToLocalTime().ToString('HH:mm'))" } else { '' })
+        }
+    }
     $acts = @(Get-CtxActiveActivations $entry)
     $pimText = if ($acts.Count) {
         ($acts | ForEach-Object { "$($_.RoleName) $(Format-CtxDuration $_.Remaining) left" + $(if ($_.ExpiresAt) { " (until $($_.ExpiresAt.ToLocalTime().ToString('HH:mm')))" }) }) -join '; '
@@ -64,9 +73,10 @@ function Get-CtxStatus {
         'Azure CLI'     = $cliText
         'Az PowerShell' = $azText
         'Graph'         = $graphText
-        'PIM'           = $pimText
-        'Tags'          = if (@($entry.tags).Count) { @($entry.tags) -join ', ' } else { '-' }
     }
+    if ($savedGraphText) { $rows['Saved Graph'] = $savedGraphText }
+    $rows['PIM'] = $pimText
+    $rows['Tags'] = if (@($entry.tags).Count) { @($entry.tags) -join ', ' } else { '-' }
     foreach ($k in $rows.Keys) {
         Write-Host ('  {0,-14}' -f $k) -ForegroundColor DarkGray -NoNewline
         Write-Host $rows[$k]
@@ -208,6 +218,15 @@ function Test-CtxSetup {
                 if ($names -notcontains $d.Name) { & $report 'Orphan folder' 'warn' "$($d.FullName) (no environment - safe to delete)" }
             }
         }
+        $graphRoot = Join-Path (Get-CtxHome) 'graph'
+        if (Test-Path -LiteralPath $graphRoot) {
+            foreach ($f in Get-ChildItem -LiteralPath $graphRoot -File) {
+                $owner = Find-CtxEnvironment $state ([IO.Path]::GetFileNameWithoutExtension($f.Name))
+                if (-not $owner -or $owner.saveGraphCredentials -ne $true) {
+                    & $report 'Saved Graph credentials' 'warn' "$($f.FullName) belongs to no environment that saves credentials - safe to delete"
+                }
+            }
+        }
 
         $azMod = Test-CtxAzAvailable
         if ($azMod) {
@@ -235,6 +254,12 @@ function Test-CtxSetup {
             foreach ($e in @($state.environments | Sort-Object { $_.name })) {
                 if ($invalid[$e.name]) { continue }
                 $label = "$($e.name)"
+                if ($e.saveGraphCredentials -eq $true) {
+                    $gi = Get-CtxGraphCredentialInfo $e
+                    if (-not $gi) { & $report "$label · graph" 'info' 'credential saving is on; nothing saved yet (saved at the next Graph sign-in)' }
+                    elseif ($gi.Expired) { & $report "$label · graph" 'info' 'saved credentials are past graphMaxSessionHours; the next Graph sign-in replaces them' }
+                    else { & $report "$label · graph" 'ok' "saved credentials$(if ($gi.RestorableUntil) { ", restorable until $($gi.RestorableUntil.ToLocalTime().ToString('HH:mm'))" })" }
+                }
                 if (Test-CtxTool $e 'cli') {
                     if (-not $az) { }
                     elseif (-not $handles[$e.name]) { & $report "$label · cli" 'warn' "not signed in yet - 'ctx $($e.name)' signs in" }
@@ -394,13 +419,14 @@ function Get-CtxHelp {
         'ctx rename <old> <new> :: rename'
         'ctx rm <name> :: remove (-SignOut, -RemoveBrowserProfile)'
         'ctx set [name] -Tags prod :: tags, -Color, -Description, -PimHours, -GraphProfile, -AdminOnSwitch'
+        'ctx set [name] -SaveGraphCredentials On :: keep the Graph sign-in (encrypted, this device); -Admin restores it for graphMaxSessionHours (default 8)'
         'ctx export | import <file> :: share definitions (no tokens)'
         '# admin'
         'ctx pim [role] :: activate (default Global Admin) + Graph; -Hours -Reason -Ticket -NoGraph'
         'ctx pim -List | -Deactivate | -Renew :: eligible/active roles, end early, start a fresh activation'
         'ctx graph [profile] :: reuse/renew Graph: Admin, ReadOnly, Pim, custom or "Scope1,Scope2"'
         'ctx graph -AddScopes "Scope1,Scope2" :: extend this session; consent only if needed'
-        'ctx graph -Relogin :: explicitly sign in with a fresh device code'
+        'ctx graph -Relogin :: explicitly sign in with a fresh device code (ignores saved credentials)'
         '# everyday'
         'ctx st [-Check] :: status of this terminal'
         'ctx sub [name] :: pick subscription (CLI + Az), remembered per environment'
