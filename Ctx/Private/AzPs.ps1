@@ -78,32 +78,66 @@ function Get-CtxAzIdentity {
     Get-CtxIdentityFromClaims (ConvertFrom-CtxJwt (ConvertFrom-CtxSecureToken $t.Token))
 }
 
+function Set-CtxAzLoginByWam {
+    <#
+    Sets Az's WAM switch for this process only (Update-AzConfig -Scope Process) and returns a script block that
+    restores the previous process value, so the user's own Az settings never change.
+    #>
+    param([Parameter(Mandatory)][bool]$Enabled)
+    $before = try { Get-AzConfig -EnableLoginByWam -WarningAction SilentlyContinue -ErrorAction Stop } catch { $null }
+    Update-AzConfig -EnableLoginByWam $Enabled -Scope Process -WarningAction SilentlyContinue -ErrorAction Stop | Out-Null
+    if ($before -and [string]$before.Scope -eq 'Process') {
+        $previous = [bool]$before.Value
+        return { Update-AzConfig -EnableLoginByWam $previous -Scope Process -WarningAction SilentlyContinue -ErrorAction SilentlyContinue | Out-Null }.GetNewClosure()
+    }
+    { Clear-AzConfig -EnableLoginByWam -Scope Process -Confirm:$false -WarningAction SilentlyContinue -ErrorAction SilentlyContinue | Out-Null }
+}
+
 function Connect-CtxAz {
     <#
-    Device-code login into a named context. The context is always persisted (CurrentUser) so the login survives;
-    with -Scope Process the user-wide default context is put back to the global ctx environment afterwards.
-    Returns the identity from the token.
+    Interactive login into a named context with the environment's sign-in method: DeviceCode, Browser (Az opens the
+    default browser; WAM off for this call) or Broker (WAM). The account is passed as login hint when known.
+    The context is always persisted (CurrentUser) so the login survives; with -Scope Process the user-wide default
+    context is put back to the global ctx environment afterwards. Returns the identity from the token.
     #>
     param(
         [Parameter(Mandatory)]$Entry,
         [ValidateSet('Process', 'CurrentUser')][string]$Scope = 'CurrentUser',
         [string]$Tenant
     )
+    $method = Get-CtxSignInMethod $Entry
+    Assert-CtxSignInMethodSupported -Method $method -Entry $Entry
     Import-CtxAzModule
     Sync-CtxAzProfileFromDisk
     $t = if ($Tenant) { $Tenant } elseif ($Entry.tenantId) { $Entry.tenantId } else { $null }
     $p = @{
-        UseDeviceAuthentication = $true
-        ContextName             = $Entry.azContextName
-        Force                   = $true
-        SkipContextPopulation   = $true
-        Scope                   = 'CurrentUser'
-        ErrorAction             = 'Stop'
-        WarningAction           = 'SilentlyContinue'
+        ContextName           = $Entry.azContextName
+        Force                 = $true
+        SkipContextPopulation = $true
+        Scope                 = 'CurrentUser'
+        ErrorAction           = 'Stop'
+        WarningAction         = 'SilentlyContinue'
     }
+    if ($method -eq 'DeviceCode') { $p.UseDeviceAuthentication = $true }
+    elseif ($Entry.upn) { $p.AccountId = [string]$Entry.upn }
     if ($t) { $p.Tenant = $t }
+    $restoreWam = $null
+    if ($method -ne 'DeviceCode') {
+        # Az's own browser sign-in cannot target a browser profile.
+        $detail = if ($method -eq 'Browser') { 'default browser (Az PowerShell cannot pick the profile) - finish the sign-in there' } else { $null }
+        Show-CtxSignInStart -Tool 'Az PowerShell' -Entry $Entry -Method $method -Detail $detail
+        if ($IsWindows) { $restoreWam = Set-CtxAzLoginByWam -Enabled ($method -eq 'Broker') }
+    }
     $sb = { Connect-AzAccount @p }.GetNewClosure()
-    Invoke-CtxDeviceLogin -ScriptBlock $sb -Entry $Entry -Tool 'Az PowerShell' | Out-Null
+    try {
+        Invoke-CtxToolLogin -ScriptBlock $sb -Entry $Entry -Tool 'Az PowerShell' | Out-Null
+    } catch {
+        $hint = Get-CtxSignInFailureHint -Message $_.Exception.Message -Method $method -Entry $Entry
+        if ($hint) { throw "$($_.Exception.Message)$hint" }
+        throw
+    } finally {
+        if ($restoreWam) { & $restoreWam }
+    }
     if ($Scope -eq 'Process') {
         $state = Read-CtxState
         $global = Find-CtxEnvironment $state $state.current
@@ -166,7 +200,7 @@ function Set-CtxAzEnvironment {
         }
     }
     if ($reason) {
-        Write-CtxMsg warn "Az PowerShell: $reason - signing in with device code"
+        Write-CtxMsg warn "Az PowerShell: $reason - signing in $(Get-CtxSignInLabel (Get-CtxSignInMethod $Entry))"
         $id = Connect-CtxAz -Entry $Entry -Scope $Scope
         if (-not (Test-CtxIdentityMatch $Entry $id)) {
             throw "Az PowerShell signed in as '$($id.Upn)' but environment '$($Entry.name)' is $($Entry.upn). Sign in with the right account."

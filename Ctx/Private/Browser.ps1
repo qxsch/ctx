@@ -1,17 +1,75 @@
-# Browser: one Edge (or Chromium) profile per environment so browser logins never collide.
+# Browser: one Edge (or Chrome/Chromium) profile per environment so browser logins never collide.
+
+function Resolve-CtxBrowserExecutable {
+    <# A configured browser: an executable, or a macOS .app bundle (resolved to Contents/MacOS/<name>). #>
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return $null }
+    if ($Path -match '\.app[\\/]*$' -and (Test-Path -LiteralPath $Path -PathType Container)) {
+        $exe = Join-Path $Path "Contents/MacOS/$([IO.Path]::GetFileNameWithoutExtension($Path.TrimEnd('/', '\')))"
+        return $(if (Test-Path -LiteralPath $exe -PathType Leaf) { $exe } else { $null })
+    }
+    if (Test-Path -LiteralPath $Path -PathType Leaf) { $Path } else { $null }
+}
 
 function Get-CtxBrowserPath {
+    <# config browserPath, else Microsoft Edge: Windows registry/Program Files, macOS /Applications, Linux PATH, WSL the Windows Edge. #>
     $cfg = Get-CtxConfig
-    if ($cfg.browserPath -and (Test-Path -LiteralPath $cfg.browserPath)) { return $cfg.browserPath }
-    $appPath = try { (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe' -ErrorAction Stop).'(default)' } catch { $null }
-    foreach ($candidate in @(
-            $appPath
-            (Join-Path ${env:ProgramFiles(x86)} 'Microsoft\Edge\Application\msedge.exe')
-            (Join-Path $env:ProgramFiles 'Microsoft\Edge\Application\msedge.exe')
-        )) {
-        if ($candidate -and (Test-Path -LiteralPath $candidate)) { return $candidate }
+    if ($cfg.browserPath) {
+        $configured = Resolve-CtxBrowserExecutable $cfg.browserPath
+        if ($configured) { return $configured }
+    }
+    $candidates = if ($IsWindows) {
+        try { (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe' -ErrorAction Stop).'(default)' } catch { $null }
+        if (${env:ProgramFiles(x86)}) { Join-Path ${env:ProgramFiles(x86)} 'Microsoft\Edge\Application\msedge.exe' }
+        if ($env:ProgramFiles) { Join-Path $env:ProgramFiles 'Microsoft\Edge\Application\msedge.exe' }
+    } elseif ($IsMacOS) {
+        '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge'
+        Join-Path $HOME 'Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge'
+    } else {
+        foreach ($name in 'microsoft-edge-stable', 'microsoft-edge') {
+            Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source
+        }
+        # WSL: the Windows Edge (its profiles live on the Windows side).
+        if ($env:WSL_DISTRO_NAME) { '/mnt/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe', '/mnt/c/Program Files/Microsoft/Edge/Application/msedge.exe' }
+    }
+    foreach ($candidate in @($candidates)) {
+        if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Leaf)) { return $candidate }
     }
     $null
+}
+
+function Get-CtxBrowserKind {
+    <# edge, chrome or chromium - from the executable name (msedge.exe, Google Chrome, google-chrome-stable, chromium-browser, ...). #>
+    param([string]$Path)
+    $leaf = [IO.Path]::GetFileNameWithoutExtension([string]$Path).ToLowerInvariant()
+    if ($leaf -match 'chromium') { 'chromium' } elseif ($leaf -match 'chrome') { 'chrome' } else { 'edge' }
+}
+
+function Get-CtxBrowserUserDataDir {
+    <# The browser's User Data folder that holds its profiles. $null for a Windows browser started from WSL. #>
+    param([Parameter(Mandatory)][ValidateSet('edge', 'chrome', 'chromium')][string]$Kind, [string]$BrowserPath)
+    if (-not $IsWindows -and $BrowserPath -match '^/mnt/[a-z]/') { return $null }
+    if ($IsWindows) {
+        $rel = switch ($Kind) { 'chrome' { 'Google\Chrome\User Data' } 'chromium' { 'Chromium\User Data' } default { 'Microsoft\Edge\User Data' } }
+        return Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) $rel
+    }
+    if ($IsMacOS) {
+        $rel = switch ($Kind) { 'chrome' { 'Google/Chrome' } 'chromium' { 'Chromium' } default { 'Microsoft Edge' } }
+        return Join-Path $HOME "Library/Application Support/$rel"
+    }
+    $config = if ($env:XDG_CONFIG_HOME -and [IO.Path]::IsPathRooted($env:XDG_CONFIG_HOME)) { $env:XDG_CONFIG_HOME } else { Join-Path $HOME '.config' }
+    $rel = switch ($Kind) { 'chrome' { 'google-chrome' } 'chromium' { 'chromium' } default { 'microsoft-edge' } }
+    Join-Path $config $rel
+}
+
+function Get-CtxBrowserProcessNames {
+    <# Process names of the configured browser on this OS (to refuse deleting a profile while it runs). #>
+    $kind = Get-CtxBrowserKind (Get-CtxBrowserPath)
+    if ($IsMacOS) {
+        switch ($kind) { 'chrome' { @('Google Chrome') } 'chromium' { @('Chromium') } default { @('Microsoft Edge') } }
+    } else {
+        switch ($kind) { 'chrome' { @('chrome') } 'chromium' { @('chromium', 'chromium-browse', 'chrome') } default { @('msedge') } }
+    }
 }
 
 function Get-CtxBrowserProfileDir {
@@ -21,11 +79,8 @@ function Get-CtxBrowserProfileDir {
         throw "Invalid browser profile name '$(ConvertTo-CtxSafeText $profileName -MaxLength 60)'."
     }
     $browser = Get-CtxBrowserPath
-    $userData = if ($browser -and (Split-Path $browser -Leaf) -ieq 'chrome.exe') {
-        Join-Path $env:LOCALAPPDATA 'Google\Chrome\User Data'
-    } else {
-        Join-Path $env:LOCALAPPDATA 'Microsoft\Edge\User Data'
-    }
+    $userData = Get-CtxBrowserUserDataDir -Kind (Get-CtxBrowserKind $browser) -BrowserPath $browser
+    if (-not $userData) { throw "The browser profile '$profileName' belongs to the Windows browser - remove it there (browser settings)." }
     Join-Path $userData $profileName
 }
 
@@ -42,7 +97,7 @@ function ConvertTo-CtxBrowserUrl {
 function New-CtxBrowserStartInfo {
     <# ProcessStartInfo for the browser; ArgumentList quotes every value on its own, so no field can add browser switches. #>
     param([Parameter(Mandatory)][string]$Browser, [Parameter(Mandatory)][string]$Url, [Parameter(Mandatory)]$Entry, [switch]$InPrivate)
-    $isChrome = (Split-Path $Browser -Leaf) -ieq 'chrome.exe'
+    $isChrome = (Get-CtxBrowserKind $Browser) -ne 'edge'
     $psi = [Diagnostics.ProcessStartInfo]::new($Browser)
     $psi.UseShellExecute = $false
     if ($InPrivate) {
@@ -66,6 +121,28 @@ function Open-CtxBrowser {
     }
     $process = [Diagnostics.Process]::Start((New-CtxBrowserStartInfo -Browser $browser -Url $target -Entry $Entry -InPrivate:$InPrivate))
     if ($process) { $process.Dispose() }
+}
+
+function Test-CtxCanOpenBrowser {
+    <# False in sessions without a local desktop (SSH, Linux without a display), where sign-in pages cannot open. #>
+    if ($IsLinux) { return [bool]($env:DISPLAY -or $env:WAYLAND_DISPLAY -or $env:WSL_DISTRO_NAME) }
+    -not ($env:SSH_CONNECTION -or $env:SSH_TTY)
+}
+
+function Get-CtxBrowserCommandLine {
+    <#
+    Value for the BROWSER variable of Azure CLI's browser sign-in (Python's webbrowser module, shlex-split), so its
+    sign-in page opens in the environment's browser profile. $null (= default browser) when no usable browser is found.
+    Characters that shlex or the %s substitution would interpret are refused instead of escaped.
+    #>
+    param([Parameter(Mandatory)]$Entry)
+    $browser = Get-CtxBrowserPath
+    if (-not $browser) { return $null }
+    $path = $browser.Replace('\', '/')
+    $profileName = [string]$Entry.browserProfile
+    if ($path -match '["%$`\\]' -or $profileName -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') { return $null }
+    # A trailing '&' makes Python start the browser in the background; otherwise az waits until the browser exits.
+    "`"$path`" --profile-directory=$profileName --no-first-run --no-default-browser-check %s &"
 }
 
 function Get-CtxPortalUrl {

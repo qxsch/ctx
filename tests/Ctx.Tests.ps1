@@ -13,6 +13,7 @@ BeforeAll {
     Import-Module $(if ($env:CTX_TEST_MODULE) { $env:CTX_TEST_MODULE } else { Join-Path $script:repoRoot 'Ctx\Ctx.psd1' }) -Force
     Mock -ModuleName Ctx Invoke-CtxOAuth { throw 'Offline test attempted an unmocked OAuth request.' }
     Mock -ModuleName Ctx Get-CtxAzGraphToken { }
+    Mock -ModuleName Ctx Get-CtxCliGraphToken { }
 
     $script:T1 = '11111111-1111-1111-1111-111111111111'
     $script:T2 = '22222222-2222-2222-2222-222222222222'
@@ -166,7 +167,7 @@ Describe 'Helpers' {
         [Environment]::GetEnvironmentVariable('CTX_TEST_VAR', 'User') | Should -BeNullOrEmpty
         InModuleScope Ctx { Set-CtxUserEnv 'CTX_TEST_VAR' $null; Get-CtxUserEnv 'CTX_TEST_VAR' } | Should -BeNullOrEmpty
     }
-    It 'detects paths synced by OneDrive' {
+    It 'detects paths synced by OneDrive' -Skip:(-not $IsWindows) {
         $saved = $env:OneDrive, $env:OneDriveCommercial, $env:OneDriveConsumer
         try {
             $env:OneDrive = 'C:\Users\x\OneDrive - Contoso'; $env:OneDriveCommercial = $env:OneDrive; $env:OneDriveConsumer = $null
@@ -952,11 +953,403 @@ Describe 'PIM and Graph login reuse' {
         { Connect-CtxGraph -AddScopes ' , ' } | Should -Throw '*at least one Microsoft Graph permission*'
         Should -Invoke Invoke-CtxOAuth -ModuleName Ctx -Times 0 -Exactly
     }
+
+    It 'reuses the Azure CLI login for Graph when there is no Az login' {
+        Set-TestState -Current 'flow' -Environments @((New-TestEnv 'flow' $T1 $O1 -Tools @('cli')))
+        $cached = New-FlowToken -ClientId 'cli-client'
+        Mock -ModuleName Ctx Get-CtxCliGraphToken { $cached }
+        Connect-CtxGraph
+        Should -Invoke Invoke-CtxOAuth -ModuleName Ctx -Times 0 -Exactly
+        InModuleScope Ctx { $script:GraphToken.Source | Should -Be 'Cli' }
+    }
+
+    It 'prefers the Az login over the Azure CLI login' {
+        $az = New-FlowToken -ClientId 'az-client'
+        Mock -ModuleName Ctx Get-CtxAzGraphToken { $az }
+        Mock -ModuleName Ctx Get-CtxCliGraphToken { throw 'must not ask the CLI' }
+        Connect-CtxGraph
+        Should -Invoke Get-CtxCliGraphToken -ModuleName Ctx -Times 0 -Exactly
+        InModuleScope Ctx { $script:GraphToken.Source | Should -Be 'Az' }
+    }
+
+    It 'skips a reused login that lacks the scopes and signs in once' {
+        $narrow = New-FlowToken -Scopes @('User.Read') -ClientId 'cli-client'
+        Mock -ModuleName Ctx Get-CtxCliGraphToken { $narrow }
+        Connect-CtxGraph
+        Should -Invoke Invoke-CtxOAuth -ModuleName Ctx -Times 1 -Exactly -ParameterFilter { $Endpoint -eq 'devicecode' }
+        InModuleScope Ctx { $script:GraphToken.Source | Should -Be 'DeviceCode' }
+    }
+
+    Context 'after a PIM activation' {
+        BeforeAll {
+            $script:activationStart = [datetime]::UtcNow.AddMinutes(-1)
+            $script:startedRole = [pscustomobject]@{
+                RoleId = '62e90394-69f5-4237-9190-012177145e10'; RoleName = 'Global Administrator'; Scope = '/'
+                Start = $activationStart; End = [datetime]::UtcNow.AddHours(2); AssignmentType = 'Activated'
+            }
+            function New-ProviderToken([hashtable]$Extra) {
+                $claims = @{
+                    aud = 'https://graph.microsoft.com'; tid = $T1; oid = $O1; upn = 'flow@contoso.com'; appid = 'az-client'
+                    scp = $dailyScopes -join ' '; exp = [DateTimeOffset]::UtcNow.AddHours(1).ToUnixTimeSeconds()
+                }
+                foreach ($k in $Extra.Keys) { $claims[$k] = $Extra[$k] }
+                [pscustomobject]@{ access_token = New-TestJwt $claims }
+            }
+        }
+        BeforeEach {
+            Mock -ModuleName Ctx Request-CtxPimActivation {
+                InModuleScope Ctx -Parameters @{ R = $startedRole } { param($R) Set-CtxActivationCache -Name 'flow' -Active @($R) }
+                $startedRole
+            }
+        }
+
+        It 'accepts a reused token whose wids already list the activated role' {
+            $before = New-ProviderToken @{ wids = @('b79fbf4d-3ef9-4689-8143-76b194e85509') }
+            $after = New-ProviderToken @{ wids = @('62e90394-69f5-4237-9190-012177145e10', 'b79fbf4d-3ef9-4689-8143-76b194e85509') }
+            $queue = [Collections.Generic.Queue[object]]::new(@($before, $after))
+            Mock -ModuleName Ctx Get-CtxAzGraphToken { $queue.Dequeue() }
+            Invoke-CtxPim
+            Should -Invoke Invoke-CtxOAuth -ModuleName Ctx -Times 0 -Exactly
+            InModuleScope Ctx { $script:GraphToken.Source | Should -Be 'Az' }
+        }
+
+        It 'accepts a token without wids only when it was issued after the activation started' {
+            $issuedAfter = [DateTimeOffset]::new($activationStart.AddSeconds(30)).ToUnixTimeSeconds()
+            $cached = New-ProviderToken @{ iat = $issuedAfter }
+            Mock -ModuleName Ctx Get-CtxAzGraphToken { $cached }
+            Invoke-CtxPim
+            Should -Invoke Invoke-CtxOAuth -ModuleName Ctx -Times 0 -Exactly
+        }
+
+        It 'signs in once when the reused token predates the activation' {
+            $issuedBefore = [DateTimeOffset]::new($activationStart.AddMinutes(-30)).ToUnixTimeSeconds()
+            $cached = New-ProviderToken @{ iat = $issuedBefore }
+            Mock -ModuleName Ctx Get-CtxAzGraphToken { $cached }
+            Mock -ModuleName Ctx Get-CtxCliGraphToken { $cached }
+            Invoke-CtxPim
+            Should -Invoke Invoke-CtxOAuth -ModuleName Ctx -Times 1 -Exactly -ParameterFilter { $Endpoint -eq 'devicecode' }
+            InModuleScope Ctx { $script:GraphToken.Source | Should -Be 'DeviceCode' }
+        }
+    }
+}
+
+Describe 'Sign-in methods' {
+    BeforeAll {
+        Mock -ModuleName Ctx Write-Host { }
+        Mock -ModuleName Ctx Start-Sleep { } -ParameterFilter { $Seconds }
+        Mock -ModuleName Ctx Show-CtxDeviceCode { }
+        Mock -ModuleName Ctx Show-CtxSignInStart { }
+        Mock -ModuleName Ctx Import-CtxGraphModule { }
+        Mock -ModuleName Ctx Connect-CtxGraphToken { }
+        Mock -ModuleName Ctx Start-CtxGraphRenewal { }
+        Mock -ModuleName Ctx Stop-CtxGraphRenewal { }
+        Mock -ModuleName Ctx Get-CtxMgContext {
+            InModuleScope Ctx {
+                if ($script:GraphToken) {
+                    [pscustomobject]@{
+                        AuthType = 'UserProvidedAccessToken'; TenantId = $script:GraphToken.TenantId
+                        Account = $script:GraphToken.Account; ClientId = $script:GraphToken.TokenClientId; Scopes = $script:GraphToken.Scopes
+                    }
+                }
+            }
+        }
+        $script:siJwt = New-TestJwt @{
+            aud = 'https://graph.microsoft.com'; tid = $T1; oid = $O1; upn = 'sign@contoso.com'; appid = '14d82eec-204b-4c2f-b7e8-296a70dab67e'
+            scp = 'User.Read.All'; exp = [DateTimeOffset]::UtcNow.AddHours(1).ToUnixTimeSeconds()
+        }
+        $script:cliJwt = New-TestJwt @{ tid = $T1; oid = $O1; upn = 'sign@contoso.com'; exp = [DateTimeOffset]::UtcNow.AddHours(1).ToUnixTimeSeconds() }
+        function Get-ClosureValue($ScriptBlock, [string]$Name) { $ScriptBlock.Module.SessionState.PSVariable.GetValue($Name) }
+    }
+    BeforeEach {
+        $e = New-TestEnv 'sign' $T1 $O1
+        Set-TestState -Current 'sign' -Environments @($e)
+    }
+    AfterEach {
+        InModuleScope Ctx { $script:GraphToken = $null; $script:GraphEnvName = $null; $script:GraphProfileName = $null }
+    }
+
+    Context 'setting' {
+        It 'defaults to device code and normalizes stored values' {
+            InModuleScope Ctx {
+                Get-CtxSignInMethod @{ name = 'x' } | Should -Be 'DeviceCode'
+                (Repair-CtxEnvironmentEntry ([ordered]@{ name = 'x'; signIn = 'browser' })).signIn | Should -Be 'Browser'
+                (Repair-CtxEnvironmentEntry ([ordered]@{ name = 'x'; signIn = 'auto' })).signIn | Should -BeNullOrEmpty
+                (Repair-CtxEnvironmentEntry ([ordered]@{ name = 'x'; signIn = 'auto' })) | Get-CtxSignInMethod | Should -Be 'DeviceCode'
+            }
+        }
+        It 'is set and cleared per environment' {
+            $null = Set-CtxEnvironment -Name sign -SignIn Browser
+            (Get-TestState).environments[0].signIn | Should -Be 'Browser'
+            (Get-CtxEnvironment -Name sign).SignIn | Should -Be 'Browser'
+            $null = Set-CtxEnvironment -Name sign -SignIn Default
+            (Get-TestState).environments[0].signIn | Should -BeNullOrEmpty
+            (Get-CtxEnvironment -Name sign).SignIn | Should -Be 'DeviceCode'
+        }
+        It 'refuses Broker where there is no Windows account broker' -Skip:$IsWindows {
+            { Set-CtxEnvironment -Name sign -SignIn Broker } | Should -Throw '*only available on Windows*'
+        }
+        It 'travels with export and import, and unknown values fall back to device code' {
+            $null = Set-CtxEnvironment -Name sign -SignIn Browser
+            $file = Join-Path $testHome 'signin-export.json'
+            Export-CtxEnvironment -Path $file
+            $doc = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json -AsHashtable
+            $doc.environments[0].signIn | Should -Be 'Browser'
+            $doc.environments += @{ name = 'other'; tenantId = $T2; userObjectId = $O2; upn = 'o@contoso.com'; signIn = 'Auto' }
+            $doc | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $file
+            Set-TestState -Current $null -Environments @()
+            Import-CtxEnvironment -Path $file
+            $state = Get-TestState
+            ($state.environments | Where-Object name -EQ 'sign').signIn | Should -Be 'Browser'
+            ($state.environments | Where-Object name -EQ 'other').signIn | Should -BeNullOrEmpty
+        }
+        It 'is stored by ctx add and used for its sign-in' {
+            Set-TestState -Current $null -Environments @()
+            Mock -ModuleName Ctx Get-CtxAzCliPath { 'C:\nowhere\az.cmd' }
+            Mock -ModuleName Ctx Test-CtxCanOpenBrowser { $true }
+            Mock -ModuleName Ctx Connect-CtxCli { $script:seenMethod = InModuleScope Ctx -Parameters @{ E = $Entry } { param($E) Get-CtxSignInMethod $E }; throw 'stop after sign-in' }
+            { Add-CtxEnvironment -Name 'fresh' -Tenant 'contoso.onmicrosoft.com' -Tools cli -SignIn Browser } | Should -Throw '*stop after sign-in*'
+            $script:seenMethod | Should -Be 'Browser'
+        }
+    }
+
+    Context 'Azure CLI and Az PowerShell' {
+        BeforeEach {
+            # Keep the user's real ~/.azure/config out of the test CLI folders.
+            InModuleScope Ctx { Set-CtxUserEnv 'AZURE_CONFIG_DIR' (Join-Path $env:CTX_HOME 'no-original-azure') }
+            Mock -ModuleName Ctx Get-CtxAzCliPath { 'C:\nowhere\az.cmd' }
+            Mock -ModuleName Ctx Get-CtxBrowserPath { 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe' }
+            Mock -ModuleName Ctx Test-CtxCanOpenBrowser { $true }
+            Mock -ModuleName Ctx Invoke-CtxAzCli { [pscustomobject]@{ Success = $true; ExitCode = 0; Output = $cliJwt; Error = ''; Value = $null } }
+            $script:cliDir = Join-Path $testHome 'cli\sign'
+            if (Test-Path -LiteralPath $cliDir) { Remove-Item -LiteralPath $cliDir -Recurse -Force }
+        }
+
+        It 'signs the CLI in with device code by default and leaves the broker setting alone' {
+            Mock -ModuleName Ctx Invoke-CtxToolLogin { $script:loginArgs = Get-ClosureValue $ScriptBlock 'loginArgs'; $script:browserVar = $env:BROWSER }
+            $id = InModuleScope Ctx { Connect-CtxCli -Entry (Find-CtxEnvironment (Read-CtxState) 'sign') }
+            $id.ObjectId | Should -Be $O1
+            $script:loginArgs | Should -Be @('login', '--use-device-code', '--allow-no-subscriptions', '-o', 'none', '--tenant', $T1)
+            $script:browserVar | Should -BeNullOrEmpty
+            Get-Content -LiteralPath (Join-Path $cliDir 'config') -Raw | Should -Not -Match 'enable_broker_on_windows'
+        }
+
+        It 'signs the CLI in with the browser profile and turns WAM off for that environment' {
+            $null = Set-CtxEnvironment -Name sign -SignIn Browser
+            $savedBrowser = $env:BROWSER
+            Mock -ModuleName Ctx Invoke-CtxToolLogin { $script:loginArgs = Get-ClosureValue $ScriptBlock 'loginArgs'; $script:browserVar = $env:BROWSER }
+            $null = InModuleScope Ctx { Connect-CtxCli -Entry (Find-CtxEnvironment (Read-CtxState) 'sign') }
+            $script:loginArgs | Should -Be @('login', '--allow-no-subscriptions', '-o', 'none', '--tenant', $T1)
+            $script:browserVar | Should -Be '"C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe" --profile-directory=ctx-sign --no-first-run --no-default-browser-check %s &'
+            $env:BROWSER | Should -Be $savedBrowser
+            if ($IsWindows) { Get-Content -LiteralPath (Join-Path $cliDir 'config') -Raw | Should -Match 'enable_broker_on_windows = false' }
+        }
+
+        It 'signs the CLI in through the broker with WAM on' -Skip:(-not $IsWindows) {
+            $null = Set-CtxEnvironment -Name sign -SignIn Broker
+            Mock -ModuleName Ctx Invoke-CtxToolLogin { $script:loginArgs = Get-ClosureValue $ScriptBlock 'loginArgs' }
+            $null = InModuleScope Ctx { Connect-CtxCli -Entry (Find-CtxEnvironment (Read-CtxState) 'sign') }
+            $script:loginArgs | Should -Not -Contain '--use-device-code'
+            Get-Content -LiteralPath (Join-Path $cliDir 'config') -Raw | Should -Match 'enable_broker_on_windows = true'
+        }
+
+        It 'explains a device-code block by Conditional Access' {
+            Mock -ModuleName Ctx Invoke-CtxToolLogin { throw 'Azure CLI sign-in failed: AADSTS53003: Access has been blocked by Conditional Access policies.' }
+            { InModuleScope Ctx { Connect-CtxCli -Entry (Find-CtxEnvironment (Read-CtxState) 'sign') } } |
+                Should -Throw '*AADSTS53003*Conditional Access may block device code*ctx set sign -SignIn Browser*'
+            InModuleScope Ctx {
+                Get-CtxSignInFailureHint -Message 'AADSTS53003: blocked' -Method DeviceCode -Entry @{ name = 'newone' } | Should -BeLike '*ctx add newone -SignIn Browser*'
+                Get-CtxSignInFailureHint -Message 'AADSTS53003: blocked' -Method Browser -Entry @{ name = 'sign' } | Should -BeNullOrEmpty
+            }
+        }
+
+        It 'refuses the browser method where no browser can open, without signing in' {
+            $null = Set-CtxEnvironment -Name sign -SignIn Browser
+            Mock -ModuleName Ctx Test-CtxCanOpenBrowser { $false }
+            Mock -ModuleName Ctx Invoke-CtxToolLogin { throw 'must not sign in' }
+            { InModuleScope Ctx { Connect-CtxCli -Entry (Find-CtxEnvironment (Read-CtxState) 'sign') } } | Should -Throw '*cannot open one*-SignIn DeviceCode*'
+            Should -Invoke Invoke-CtxToolLogin -ModuleName Ctx -Times 0 -Exactly
+        }
+
+        It 'signs Az PowerShell in with the account hint and WAM per method' {
+            Mock -ModuleName Ctx Import-CtxAzModule { }
+            Mock -ModuleName Ctx Sync-CtxAzProfileFromDisk { }
+            Mock -ModuleName Ctx Update-CtxAzProfileStamp { }
+            Mock -ModuleName Ctx Get-CtxAzIdentity { [pscustomobject]@{ TenantId = $T1; ObjectId = $O1; Upn = 'sign@contoso.com' } }
+            Mock -ModuleName Ctx Set-CtxAzLoginByWam { { } }
+            Mock -ModuleName Ctx Invoke-CtxToolLogin { $script:azParams = (Get-ClosureValue $ScriptBlock 'p').Clone() }
+
+            $null = InModuleScope Ctx { Connect-CtxAz -Entry (Find-CtxEnvironment (Read-CtxState) 'sign') }
+            $script:azParams.UseDeviceAuthentication | Should -BeTrue
+            $script:azParams.ContainsKey('AccountId') | Should -BeFalse
+            Should -Invoke Set-CtxAzLoginByWam -ModuleName Ctx -Times 0 -Exactly
+
+            $null = Set-CtxEnvironment -Name sign -SignIn Browser
+            $null = InModuleScope Ctx { Connect-CtxAz -Entry (Find-CtxEnvironment (Read-CtxState) 'sign') }
+            $script:azParams.ContainsKey('UseDeviceAuthentication') | Should -BeFalse
+            $script:azParams.AccountId | Should -Be 'sign@contoso.com'
+            if ($IsWindows) { Should -Invoke Set-CtxAzLoginByWam -ModuleName Ctx -Times 1 -Exactly -ParameterFilter { $Enabled -eq $false } }
+        }
+
+        It 'builds the browser command for Azure CLI only from safe values' {
+            InModuleScope Ctx {
+                Get-CtxBrowserCommandLine @{ browserProfile = 'ctx-x' } | Should -BeLike '"C:/Program Files (x86)/*msedge.exe" --profile-directory=ctx-x *%s &'
+                Get-CtxBrowserCommandLine @{ browserProfile = 'ctx x"; rm' } | Should -BeNullOrEmpty
+                Mock Get-CtxBrowserPath { 'C:\Users\a"b\msedge.exe' }
+                Get-CtxBrowserCommandLine @{ browserProfile = 'ctx-x' } | Should -BeNullOrEmpty
+            }
+        }
+    }
+
+    Context 'Microsoft Graph' {
+        It 'asks the browser provider when the environment signs in with the browser' {
+            $null = Set-CtxEnvironment -Name sign -SignIn Browser
+            Mock -ModuleName Ctx Test-CtxCanOpenBrowser { $true }
+            Mock -ModuleName Ctx Request-CtxGraphBrowserToken { [pscustomobject]@{ access_token = $siJwt; refresh_token = 'browser-rt' } }
+            Connect-CtxGraph -Scopes 'User.Read.All'
+            Should -Invoke Request-CtxGraphBrowserToken -ModuleName Ctx -Times 1 -Exactly
+            Should -Invoke Invoke-CtxOAuth -ModuleName Ctx -Times 0 -Exactly
+            InModuleScope Ctx {
+                $script:GraphToken.Source | Should -Be 'Browser'
+                $script:GraphToken.RefreshToken | Should -Be 'browser-rt'
+            }
+        }
+
+        It 'asks the broker provider when the environment signs in through the broker' -Skip:(-not $IsWindows) {
+            $null = Set-CtxEnvironment -Name sign -SignIn Broker
+            Mock -ModuleName Ctx Request-CtxGraphBrokerToken { [pscustomobject]@{ access_token = $siJwt } }
+            Connect-CtxGraph -Scopes 'User.Read.All'
+            Should -Invoke Request-CtxGraphBrokerToken -ModuleName Ctx -Times 1 -Exactly
+            InModuleScope Ctx {
+                $script:GraphToken.Source | Should -Be 'Broker'
+                $script:GraphToken.RefreshToken | Should -BeNullOrEmpty
+            }
+        }
+
+        It 'asks the broker only from ctx commands, never from the timer or the prompt' {
+            InModuleScope Ctx -Parameters @{ J = $siJwt } {
+                param($J)
+                $script:GraphToken = @{
+                    Entry = Find-CtxEnvironment (Read-CtxState) 'sign'; TenantId = '11111111-1111-1111-1111-111111111111'; ObjectId = 'aaaaaaaa-0000-0000-0000-000000000001'
+                    Account = 'sign@contoso.com'; ClientId = 'cid'; TokenClientId = 'cid'; Scope = 'User.Read.All'; Scopes = @('User.Read.All')
+                    Source = 'Broker'; RefreshToken = $null; ExpiresAt = [datetime]::UtcNow.AddMinutes(5); SessionStartedAt = [datetime]::UtcNow
+                    RetryAfter = $null; LastError = $null; ErrorCode = $null; Warned = $false; AccessToken = $J
+                }
+                Mock Get-CtxProviderGraphToken { [pscustomobject]@{ access_token = $J } }
+                Update-CtxGraphToken -Quiet | Should -BeTrue
+                Update-CtxGraphToken | Should -BeTrue
+                Should -Invoke Get-CtxProviderGraphToken -Times 0 -Exactly
+                $script:GraphToken.Warned | Should -BeTrue
+                Update-CtxGraphToken -AllowBroker | Should -BeTrue
+                Should -Invoke Get-CtxProviderGraphToken -Times 1 -Exactly -ParameterFilter { $Source -eq 'Broker' }
+                $script:GraphToken.Warned | Should -BeFalse
+            }
+        }
+
+        It 'takes the broker token from the Graph SDK connection and disconnects it' -Skip:(-not $IsWindows) {
+            foreach ($name in 'Connect-MgGraph', 'Invoke-MgGraphRequest', 'Disconnect-MgGraph', 'Get-MgGraphOption') {
+                if (-not (Get-Command $name -ErrorAction SilentlyContinue)) {
+                    New-Item -Path "function:global:$name" -Value { param($TenantId, $ClientId, $Scopes, $LoginHint, $ContextScope, [switch]$NoWelcome, $Method, $Uri, $OutputType) } | Out-Null
+                }
+            }
+            Mock -ModuleName Ctx Get-MgGraphOption { [pscustomobject]@{ DisableLoginByWAM = $false } }
+            Mock -ModuleName Ctx Connect-MgGraph { }
+            Mock -ModuleName Ctx Disconnect-MgGraph { }
+            Mock -ModuleName Ctx Invoke-MgGraphRequest {
+                $req = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, 'https://graph.microsoft.com/v1.0/me')
+                $req.Headers.Authorization = [System.Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $siJwt)
+                $resp = [System.Net.Http.HttpResponseMessage]::new()
+                $resp.RequestMessage = $req
+                $resp
+            }
+            $r = InModuleScope Ctx {
+                Request-CtxGraphBrokerToken -Entry (Find-CtxEnvironment (Read-CtxState) 'sign') -ClientId 'cid' -Scope 'User.Read.All offline_access openid profile' -Tool 'Graph'
+            }
+            $r.access_token | Should -Be $siJwt
+            Should -Invoke Connect-MgGraph -ModuleName Ctx -Times 1 -Exactly -ParameterFilter {
+                $TenantId -eq '11111111-1111-1111-1111-111111111111' -and $ClientId -eq 'cid' -and $LoginHint -eq 'sign@contoso.com' -and
+                $ContextScope -eq 'Process' -and (@($Scopes) -join ' ') -eq 'User.Read.All'
+            }
+            Should -Invoke Disconnect-MgGraph -ModuleName Ctx -Times 1 -Exactly
+        }
+    }
+
+    Context 'browser flow' {
+        It 'creates S256 PKCE pairs and parses loopback requests strictly' {
+            InModuleScope Ctx {
+                $p = New-CtxPkce
+                $p.Verifier.Length | Should -BeGreaterOrEqual 43
+                $p.Challenge | Should -Be (ConvertTo-CtxBase64Url ([Security.Cryptography.SHA256]::HashData([Text.Encoding]::ASCII.GetBytes($p.Verifier))))
+                $req = ConvertFrom-CtxLoopbackRequest 'GET /?code=a%2Bb&state=s1&session_state=x HTTP/1.1'
+                $req.Path | Should -Be '/'
+                $req.Query['code'] | Should -Be 'a+b'
+                $req.Query['state'] | Should -Be 's1'
+                ConvertFrom-CtxLoopbackRequest 'POST / HTTP/1.1' | Should -BeNullOrEmpty
+                ConvertFrom-CtxLoopbackRequest 'GET http://evil/ HTTP/1.1' | Should -BeNullOrEmpty
+            }
+        }
+
+        It 'completes the auth code flow through the loopback redirect and ignores stray requests' {
+            Mock -ModuleName Ctx Open-CtxBrowser {
+                $q = InModuleScope Ctx -Parameters @{ U = $Url } { param($U) ConvertFrom-CtxQueryString ([uri]$U).Query }
+                $script:authorizeQuery = $q
+                # Sequential requests from another thread: the listener runs on this one once the browser "opened".
+                $script:browserJob = Start-ThreadJob -ArgumentList $q.redirect_uri, $q.state -ScriptBlock {
+                    param($Base, $State)
+                    foreach ($path in '/favicon.ico', '/?code=forged&state=wrong', "/?code=the-code&state=$State") {
+                        [int](Invoke-WebRequest -Uri "$Base$path" -NoProxy -SkipHttpErrorCheck -TimeoutSec 15).StatusCode
+                    }
+                }
+            }
+            Mock -ModuleName Ctx Invoke-CtxOAuth { [pscustomobject]@{ access_token = $siJwt; refresh_token = 'rt' } } -ParameterFilter { $Endpoint -eq 'token' }
+            $r = InModuleScope Ctx {
+                Request-CtxGraphBrowserToken -Entry (Find-CtxEnvironment (Read-CtxState) 'sign') -ClientId 'cid' -Scope 'User.Read.All offline_access' -Tool 'Graph' -TimeoutSeconds 30
+            }
+            $codes = @(Receive-Job -Job $browserJob -Wait -AutoRemoveJob)
+            $r.refresh_token | Should -Be 'rt'
+            $codes | Should -Be @(404, 400, 200)
+            $authorizeQuery.response_type | Should -Be 'code'
+            $authorizeQuery.code_challenge_method | Should -Be 'S256'
+            $authorizeQuery.login_hint | Should -Be 'sign@contoso.com'
+            $authorizeQuery.redirect_uri | Should -Match '^http://localhost:\d+$'
+            Should -Invoke Invoke-CtxOAuth -ModuleName Ctx -Times 1 -Exactly -ParameterFilter {
+                $Endpoint -eq 'token' -and $Body.grant_type -eq 'authorization_code' -and $Body.code -eq 'the-code' -and
+                $Body.redirect_uri -eq $authorizeQuery.redirect_uri -and
+                (InModuleScope Ctx -Parameters @{ V = $Body.code_verifier } { param($V) ConvertTo-CtxBase64Url ([Security.Cryptography.SHA256]::HashData([Text.Encoding]::ASCII.GetBytes($V))) }) -eq $authorizeQuery.code_challenge
+            }
+        }
+
+        It 'reports a sign-in error returned to the loopback redirect' {
+            Mock -ModuleName Ctx Open-CtxBrowser {
+                $q = InModuleScope Ctx -Parameters @{ U = $Url } { param($U) ConvertFrom-CtxQueryString ([uri]$U).Query }
+                $script:browserJob = Start-ThreadJob -ArgumentList $q.redirect_uri, $q.state -ScriptBlock {
+                    param($Base, $State)
+                    [int](Invoke-WebRequest -Uri "$Base/?error=access_denied&error_description=AADSTS65004%3A+User+declined+to+consent.&state=$State" -NoProxy -SkipHttpErrorCheck -TimeoutSec 15).StatusCode
+                }
+            }
+            { InModuleScope Ctx { Request-CtxGraphBrowserToken -Entry (Find-CtxEnvironment (Read-CtxState) 'sign') -ClientId 'cid' -Scope 'User.Read.All' -Tool 'Graph' -TimeoutSeconds 30 } } |
+                Should -Throw 'Graph sign-in failed: AADSTS65004: User declined to consent.'
+            Receive-Job -Job $browserJob -Wait -AutoRemoveJob | Should -Be 400
+            Should -Invoke Invoke-CtxOAuth -ModuleName Ctx -Times 0 -Exactly -ParameterFilter { $Endpoint -eq 'token' }
+        }
+    }
+
+    Context 'freshness after PIM' {
+        It 'needs cached activations to judge a token' {
+            InModuleScope Ctx -Parameters @{ J = $siJwt } {
+                param($J)
+                Test-CtxGraphTokenFresh -AccessToken $J -Entry @{ name = 'x'; activations = @() } | Should -BeFalse
+                $entry = @{ name = 'x'; activations = @(@{ roleId = '62E90394-69F5-4237-9190-012177145E10'; startedAt = '2030-01-01T00:00:00Z'; expiresAt = $null }) }
+                Test-CtxGraphTokenFresh -AccessToken $J -Entry $entry | Should -BeFalse
+            }
+        }
+    }
 }
 
 Describe 'Saved Graph credentials' {
     BeforeAll {
         Mock -ModuleName Ctx Write-Host { }
+        # Linux/macOS CI has no keyring: the opt-in key file exercises the same AES + HMAC protection.
+        if (-not $IsWindows) { $null = Set-CtxConfig -Name graphCredentialStore -Value file }
         Mock -ModuleName Ctx Start-Sleep { }
         Mock -ModuleName Ctx Show-CtxDeviceCode { }
         Mock -ModuleName Ctx Import-CtxGraphModule { }
@@ -1527,11 +1920,11 @@ Describe 'Security hardening' {
     It 'never starts az with an injected tenant id' {
         Mock -ModuleName Ctx Get-CtxAzCliPath { 'C:\nowhere\az.cmd' }
         Mock -ModuleName Ctx Initialize-CtxCliDir { }
-        Mock -ModuleName Ctx Invoke-CtxDeviceLogin { }
+        Mock -ModuleName Ctx Invoke-CtxToolLogin { }
         $bad = @{ name = 'evil'; tenantId = 'x"&echo pwned>%TEMP%\ctx-pwned.txt&rem "' }
         { InModuleScope Ctx -Parameters @{ E = $bad } { param($E) Start-CtxCliTokenCheck $E } } | Should -Throw '*shell metacharacters*'
         { InModuleScope Ctx -Parameters @{ E = $bad } { param($E) Connect-CtxCli -Entry $E -Dir (Join-Path $env:CTX_HOME 'cli\evil') } } | Should -Throw '*shell metacharacters*'
-        Should -Invoke Invoke-CtxDeviceLogin -ModuleName Ctx -Times 0 -Exactly
+        Should -Invoke Invoke-CtxToolLogin -ModuleName Ctx -Times 0 -Exactly
     }
     It 'validates tenants on add before any sign-in' {
         Set-TestState -Current $null -Environments @()
@@ -1667,19 +2060,23 @@ Describe 'Reliability and safety' {
         } finally { ctx config -Reset }
     }
     It 'does not write state when the lock cannot be acquired' {
-        $lockName = InModuleScope Ctx { Get-CtxLockName }
+        # Windows: the named mutex; Linux/macOS: the exclusive lock file in the data folder.
+        $lockName = if ($IsWindows) { InModuleScope Ctx { Get-CtxLockName } } else { Join-Path $env:CTX_HOME '.lock' }
         $ready = [Threading.ManualResetEventSlim]::new($false)
         $release = [Threading.ManualResetEventSlim]::new($false)
         # The mutex is owned by a thread, so another runspace (its own thread) holds it.
         $holder = [powershell]::Create().AddScript({
-                param($Name, $Ready, $Release)
-                $m = [Threading.Mutex]::new($false, $Name)
-                [void]$m.WaitOne()
+                param($Name, $Ready, $Release, $UseMutex)
+                if ($UseMutex) {
+                    $m = [Threading.Mutex]::new($false, $Name)
+                    [void]$m.WaitOne()
+                } else {
+                    $f = [IO.File]::Open($Name, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+                }
                 $Ready.Set()
                 [void]$Release.Wait(10000)
-                $m.ReleaseMutex()
-                $m.Dispose()
-            }).AddArgument($lockName).AddArgument($ready).AddArgument($release)
+                if ($UseMutex) { $m.ReleaseMutex(); $m.Dispose() } else { $f.Dispose() }
+            }).AddArgument($lockName).AddArgument($ready).AddArgument($release).AddArgument([bool]$IsWindows)
         $async = $holder.BeginInvoke()
         try {
             $ready.Wait(5000) | Should -BeTrue
@@ -1697,15 +2094,20 @@ Describe 'Reliability and safety' {
         }
     }
     It 'parses editors with arguments' {
-        $saved = $env:EDITOR
+        $saved = $env:EDITOR, $env:VISUAL
         try {
+            $env:VISUAL = $null
             $env:EDITOR = 'ctx-no-such-editor --wait'
             InModuleScope Ctx { Get-CtxEditorCommand } | Should -Be @('ctx-no-such-editor', '--wait')
             $env:EDITOR = '"C:\Program Files\No Such\ed.exe" -n'
             InModuleScope Ctx { Get-CtxEditorCommand } | Should -Be @('C:\Program Files\No Such\ed.exe', '-n')
             $env:EDITOR = 'pwsh'
             InModuleScope Ctx { Get-CtxEditorCommand } | Should -Be 'pwsh'
-        } finally { $env:EDITOR = $saved }
+            if (-not $IsWindows) {
+                $env:VISUAL = 'ctx-visual --wait'
+                InModuleScope Ctx { Get-CtxEditorCommand } | Should -Be @('ctx-visual', '--wait')
+            }
+        } finally { $env:EDITOR, $env:VISUAL = $saved }
     }
     It 'doctor checks Az autosave, orphaned Az contexts and unsafe environments' {
         Set-TestState -Current 'alpha' -Environments @(
@@ -1745,7 +2147,7 @@ Describe 'Reliability and safety' {
     }
 }
 
-Describe 'Module signature check' {
+Describe 'Module signature check' -Skip:(-not $IsWindows) {
     BeforeAll {
         $script:sigDir = Join-Path $testHome 'sigcheck'
         New-Item -ItemType Directory -Path $sigDir -Force | Out-Null
@@ -1808,6 +2210,161 @@ Describe 'Uninstall safety' {
         $out | Should -Not -BeLike '*Data folder not deleted*'
         $out | Should -BeLike '*Delete ctx data folder*'
         Test-Path -LiteralPath (Join-Path $d 'graph\flow.dat') | Should -BeTrue
+    }
+}
+
+Describe 'Cross-platform' {
+    It 'uses a per-OS data folder that no sync client picks up' {
+        $default = InModuleScope Ctx { Get-CtxDefaultHome }
+        if ($IsWindows) { $default | Should -Be (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'ctx') }
+        elseif ($IsMacOS) { $default | Should -Be (Join-Path $HOME 'Library/Application Support/ctx') }
+        else {
+            $saved = $env:XDG_DATA_HOME
+            try {
+                $env:XDG_DATA_HOME = '/xdg/data'
+                InModuleScope Ctx { Get-CtxDefaultHome } | Should -Be '/xdg/data/ctx'
+                $env:XDG_DATA_HOME = 'relative'
+                InModuleScope Ctx { Get-CtxDefaultHome } | Should -Be (Join-Path $HOME '.local/share/ctx')
+            } finally { $env:XDG_DATA_HOME = $saved }
+        }
+    }
+
+    It 'creates the data folder for its owner only' -Skip:$IsWindows {
+        $dir = Join-Path $testHome "private-$([guid]::NewGuid().ToString('n'))"
+        $saved = $env:CTX_HOME
+        try {
+            $env:CTX_HOME = $dir
+            $null = InModuleScope Ctx { Get-CtxHome }
+            InModuleScope Ctx -Parameters @{ D = $dir } { param($D) Get-CtxUnixMode $D } | Should -Be '700'
+        } finally { $env:CTX_HOME = $saved }
+    }
+
+    It 'keeps the variables for new processes in global.env, read by the shell profiles' -Skip:$IsWindows {
+        $saved = $env:CTX_SANDBOX_USERENV
+        try {
+            $env:CTX_SANDBOX_USERENV = $null
+            if ($IsMacOS) { Mock -ModuleName Ctx launchctl { } }
+            InModuleScope Ctx {
+                Set-CtxUserEnv 'AZURE_CONFIG_DIR' '/data/ctx/cli/emea'
+                Set-CtxUserEnv 'AZURE_EXTENSION_DIR' '/data/ctx/ext'
+                Get-CtxUserEnv 'AZURE_CONFIG_DIR' | Should -Be '/data/ctx/cli/emea'
+                $text = [IO.File]::ReadAllText((Get-CtxGlobalEnvPath))
+                $text | Should -Match '(?m)^AZURE_CONFIG_DIR=/data/ctx/cli/emea$'
+                $text | Should -Match '(?m)^AZURE_EXTENSION_DIR=/data/ctx/ext$'
+                Set-CtxUserEnv 'AZURE_CONFIG_DIR' $null
+                Get-CtxUserEnv 'AZURE_CONFIG_DIR' | Should -BeNullOrEmpty
+                Get-CtxUserEnv 'AZURE_EXTENSION_DIR' | Should -Be '/data/ctx/ext'
+                { Set-CtxUserEnv 'PATH' '/evil' } | Should -Throw '*does not manage*'
+                { Set-CtxUserEnv 'AZURE_CONFIG_DIR' "/a`nPATH=/evil" } | Should -Throw '*multi-line*'
+                Set-CtxUserEnv 'AZURE_EXTENSION_DIR' $null
+            }
+            if ($IsMacOS) { Should -Invoke launchctl -ModuleName Ctx -ParameterFilter { $args -contains 'setenv' } }
+        } finally { $env:CTX_SANDBOX_USERENV = $saved }
+    }
+
+    It 'only shells profiles with the ctx block count as readers of global.env' -Skip:$IsWindows {
+        $fakeHome = Join-Path $testHome "home-$([guid]::NewGuid().ToString('n'))"
+        New-Item -ItemType Directory -Path $fakeHome | Out-Null
+        Set-Content -LiteralPath (Join-Path $fakeHome '.bashrc') -Value "alias x=y`n# >>> ctx >>>`nctx_env=x`n# <<< ctx <<<"
+        Set-Content -LiteralPath (Join-Path $fakeHome '.zshenv') -Value 'export A=b'
+        InModuleScope Ctx -Parameters @{ H = $fakeHome } { param($H) @(Get-CtxShellProfileReaders -HomePath $H) } | Should -Be @('~/.bashrc')
+    }
+
+    It 'protects saved credentials with encrypt-then-MAC and detects tampering' {
+        InModuleScope Ctx {
+            $key = [byte[]]::new(32); [Security.Cryptography.RandomNumberGenerator]::Fill($key)
+            $plain = [Text.Encoding]::UTF8.GetBytes('refresh-token-ünicode')
+            $protected = Protect-CtxBytes -Plain $plain -Key $key
+            [Text.Encoding]::UTF8.GetString((Unprotect-CtxBytes -Protected $protected -Key $key)) | Should -Be 'refresh-token-ünicode'
+            Protect-CtxBytes -Plain $plain -Key $key | Should -Not -Be $protected
+            $bytes = [Convert]::FromBase64String($protected); $bytes[20] = $bytes[20] -bxor 1
+            { Unprotect-CtxBytes -Protected ([Convert]::ToBase64String($bytes)) -Key $key } | Should -Throw '*changed*'
+            $other = [byte[]]::new(32); [Security.Cryptography.RandomNumberGenerator]::Fill($other)
+            { Unprotect-CtxBytes -Protected $protected -Key $other } | Should -Throw '*changed or belongs to another key*'
+        }
+    }
+
+    It 'keeps the key in an owner-only file only after opting in' -Skip:$IsWindows {
+        Mock -ModuleName Ctx Write-Host { }
+        InModuleScope Ctx { $script:CtxSecretKey = $null }
+        try {
+            $null = Set-CtxConfig -Name graphCredentialStore -Value file
+            InModuleScope Ctx {
+                $text = Protect-CtxText 'secret'
+                $text | Should -BeLike 'aes1:*'
+                $script:CtxSecretKey = $null
+                Unprotect-CtxText $text | Should -Be 'secret'
+                Get-CtxUnixMode (Get-CtxSecretKeyFile) | Should -Be '600'
+            }
+            { Set-CtxConfig -Name graphCredentialStore -Value cloud } | Should -Throw '*keyring*file*'
+        } finally {
+            $null = Set-CtxConfig -Name graphCredentialStore -Reset
+            InModuleScope Ctx { $script:CtxSecretKey = $null }
+        }
+    }
+
+    It 'refuses to save Graph credentials without a keyring unless the key file is chosen' -Skip:$IsWindows {
+        Mock -ModuleName Ctx Write-Host { }
+        Set-TestState -Current 'kr' -Environments @((New-TestEnv 'kr' $T1 $O1))
+        Mock -ModuleName Ctx Get-CtxSecretStoreKind { $null }
+        { Set-CtxEnvironment -Name kr -SaveGraphCredentials On } | Should -Throw '*no keyring found*graphCredentialStore file*'
+        (Get-TestState).environments[0].saveGraphCredentials | Should -BeFalse
+    }
+
+    It 'recognizes Edge, Chrome and Chromium by their executable on every OS' {
+        InModuleScope Ctx {
+            Get-CtxBrowserKind 'C:\Program Files\Microsoft\Edge\Application\msedge.exe' | Should -Be 'edge'
+            Get-CtxBrowserKind '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge' | Should -Be 'edge'
+            Get-CtxBrowserKind '/usr/bin/microsoft-edge-stable' | Should -Be 'edge'
+            Get-CtxBrowserKind 'C:\Program Files\Google\Chrome\Application\chrome.exe' | Should -Be 'chrome'
+            Get-CtxBrowserKind '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' | Should -Be 'chrome'
+            Get-CtxBrowserKind '/usr/bin/google-chrome-stable' | Should -Be 'chrome'
+            Get-CtxBrowserKind '/usr/bin/chromium-browser' | Should -Be 'chromium'
+            $edge = Get-CtxBrowserUserDataDir -Kind edge -BrowserPath 'x'
+            if ($IsWindows) { $edge | Should -BeLike '*\Microsoft\Edge\User Data' }
+            elseif ($IsMacOS) { $edge | Should -Be (Join-Path $HOME 'Library/Application Support/Microsoft Edge') }
+            else {
+                $edge | Should -BeLike '*/microsoft-edge'
+                Get-CtxBrowserUserDataDir -Kind edge -BrowserPath '/mnt/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe' | Should -BeNullOrEmpty
+            }
+        }
+    }
+
+    It 'resolves a configured macOS app bundle to its executable' -Skip:$IsWindows {
+        $bundle = Join-Path $testHome 'Google Chrome.app'
+        New-Item -ItemType Directory -Path (Join-Path $bundle 'Contents/MacOS') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $bundle 'Contents/MacOS/Google Chrome') -Value ''
+        InModuleScope Ctx -Parameters @{ B = $bundle } { param($B) Resolve-CtxBrowserExecutable $B } | Should -Be (Join-Path $bundle 'Contents/MacOS/Google Chrome')
+    }
+
+    It 'knows when no browser can open (SSH, no display)' {
+        $saved = $env:SSH_CONNECTION, $env:SSH_TTY, $env:DISPLAY, $env:WAYLAND_DISPLAY, $env:WSL_DISTRO_NAME
+        try {
+            $env:SSH_CONNECTION = $null; $env:SSH_TTY = $null; $env:DISPLAY = $null; $env:WAYLAND_DISPLAY = $null; $env:WSL_DISTRO_NAME = $null
+            if ($IsLinux) {
+                InModuleScope Ctx { Test-CtxCanOpenBrowser } | Should -BeFalse
+                $env:DISPLAY = ':0'
+                InModuleScope Ctx { Test-CtxCanOpenBrowser } | Should -BeTrue
+            } else {
+                InModuleScope Ctx { Test-CtxCanOpenBrowser } | Should -BeTrue
+                $env:SSH_CONNECTION = '10.0.0.1 50000 10.0.0.2 22'
+                InModuleScope Ctx { Test-CtxCanOpenBrowser } | Should -BeFalse
+            }
+        } finally { $env:SSH_CONNECTION, $env:SSH_TTY, $env:DISPLAY, $env:WAYLAND_DISPLAY, $env:WSL_DISTRO_NAME = $saved }
+    }
+
+    It 'nests the state lock within one process' {
+        InModuleScope Ctx { Invoke-CtxLocked { Invoke-CtxLocked { 'inner' } } } | Should -Be 'inner'
+        if (-not $IsWindows) { InModuleScope Ctx { $script:CtxFileLockDepth } | Should -Be 0 }
+    }
+
+    It 'runs the locked body with the caller''s variables, not the lock''s' {
+        InModuleScope Ctx { $path = 'caller'; $stream = 'caller'; $deadline = 'caller'; Invoke-CtxLocked { "$path $stream $deadline" } } |
+            Should -Be 'caller caller caller'
+    }
+
+    It 'reports Authenticode as Windows-only elsewhere' -Skip:$IsWindows {
+        (InModuleScope Ctx { Test-CtxModuleSignature -ModuleBase '/nowhere' }).Detail | Should -BeLike '*only checked on Windows*'
     }
 }
 

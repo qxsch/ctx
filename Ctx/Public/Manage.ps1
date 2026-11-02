@@ -40,6 +40,7 @@ function Get-CtxEnvironment {
             CliSubscription = if ($cliSub -and $cliSub.id -ine $e.tenantId) { $cliSub.name } else { $null }
             AzSubscription  = $e.azSubscriptionName
             GraphProfile    = $e.graphProfile
+            SignIn          = Get-CtxSignInMethod $e
             SaveGraphCredentials = [bool]$e.saveGraphCredentials
             Description     = $e.description
             Color           = Get-CtxEnvColor $e
@@ -51,20 +52,27 @@ function Get-CtxEnvironment {
 function Add-CtxEnvironment {
     <#
     .SYNOPSIS
-    Creates an environment: a name for one tenant + one login. Signs in with device code.
+    Creates an environment: a name for one tenant + one login. Signs in with device code unless -SignIn says otherwise.
     .DESCRIPTION
-    Signs in to Azure CLI and Az PowerShell (device code, in the environment's own browser profile), reads tenant and
-    user from the token and refuses duplicates (same tenant + same login = same environment).
+    Signs in to Azure CLI and Az PowerShell (device code by default, sign-in pages in the environment's own browser
+    profile), reads tenant and user from the token and refuses duplicates (same tenant + same login = same environment).
     .PARAMETER Tenant
     Tenant domain or ID. Leave empty to use the home tenant of the account you sign in with.
     .PARAMETER Tools
     Which tools ctx manages for this environment: cli (Azure CLI), az (Az PowerShell). Default: both.
     .PARAMETER Subscription
     Subscription (name or ID) to start in. Default: pick from the list.
+    .PARAMETER SignIn
+    How this environment signs in, now and for every later sign-in (expired logins, Graph, PIM):
+    DeviceCode (default), Browser (sign-in page in the environment's browser profile; for tenants whose Conditional
+    Access blocks device code) or Broker (Windows account manager, WAM; satisfies device-based Conditional Access).
+    Change it later with ctx set <name> -SignIn.
     .EXAMPLE
     ctx add switzerland contoso-ch.onmicrosoft.com -Tags prod
     .EXAMPLE
     ctx add emea3
+    .EXAMPLE
+    ctx add fabrikam fabrikam.onmicrosoft.com -SignIn Browser
     #>
     [CmdletBinding()]
     param(
@@ -75,12 +83,15 @@ function Add-CtxEnvironment {
         [string]$Color,
         [string]$Description,
         [string]$Subscription,
+        [ValidateSet('DeviceCode', 'Browser', 'Broker')][string]$SignIn,
         [switch]$NoSwitch
     )
     $n = Assert-CtxName $Name
     $state = Read-CtxState
     if (Find-CtxEnvironment $state $n) { throw "Environment '$n' already exists. Switch with 'ctx $n' or choose another name." }
     $Color = Assert-CtxColor $Color
+    $method = ConvertTo-CtxSignInMethod $SignIn
+    if ($method) { Assert-CtxSignInMethodSupported -Method $method -Entry @{ name = $n; signIn = $method } }
     $useCli = $Tools -contains 'cli'
     $useAz = $Tools -contains 'az'
     if ($useCli -and -not (Get-CtxAzCliPath)) { throw 'Azure CLI (az) not found. Install it or use -Tools az.' }
@@ -115,6 +126,7 @@ function Add-CtxEnvironment {
         graphProfile         = $null
         graphClientId        = $null
         adminOnSwitch        = $null
+        signIn               = $method
         saveGraphCredentials = $false
         pim                  = [ordered]@{}
         activations          = @()
@@ -123,7 +135,11 @@ function Add-CtxEnvironment {
         lastUsed             = $null
     }
     Write-CtxMsg step "Adding '$n' - sign in with the account that belongs to this environment"
-    Write-CtxMsg dim "Device-code pages open in the browser profile 'ctx-$n', so sign-ins of different environments never mix."
+    switch (Get-CtxSignInMethod $entry) {
+        'Browser' { Write-CtxMsg dim "Sign-in pages open in the browser profile 'ctx-$n', so sign-ins of different environments never mix." }
+        'Broker' { Write-CtxMsg dim 'Sign-in uses the Windows account broker (WAM): pick the account of this environment in its dialog.' }
+        default { Write-CtxMsg dim "Device-code pages open in the browser profile 'ctx-$n', so sign-ins of different environments never mix." }
+    }
 
     $pending = Join-Path (Join-Path (Get-CtxHome) 'cli') ".pending-$([guid]::NewGuid().ToString('n').Substring(0, 8))"
     $azTouched = $false
@@ -277,7 +293,7 @@ function Remove-CtxEnvironment {
 
     if ($RemoveBrowserProfile) {
         $profileDir = try { Get-CtxBrowserProfileDir $entry } catch { Write-CtxMsg warn $_.Exception.Message; $null }
-        if ($profileDir -and (Get-Process -Name msedge, chrome -ErrorAction SilentlyContinue)) {
+        if ($profileDir -and (Get-Process -Name (Get-CtxBrowserProcessNames) -ErrorAction SilentlyContinue)) {
             Write-CtxMsg warn "Browser is running - close it and delete '$profileDir' manually."
         } elseif ($profileDir -and (Test-Path -LiteralPath $profileDir)) {
             try { Remove-Item -LiteralPath $profileDir -Recurse -Force -ErrorAction Stop; Write-CtxMsg ok "Browser profile '$($entry.browserProfile)' removed" }
@@ -363,14 +379,20 @@ function Set-CtxEnvironment {
     Graph scope profile: Admin, ReadOnly, Pim, a custom profile from config, or a scope list. 'Default' clears it.
     .PARAMETER SaveGraphCredentials
     On = keep this environment's Microsoft Graph refresh token (encrypted for your Windows user, on this device) and
-    restore it on the next Graph connect (ctx <name> -Admin, ctx pim, ctx graph) instead of asking for a device code.
+    restore it on the next Graph connect (ctx <name> -Admin, ctx pim, ctx graph) instead of signing in again.
     Restoring stops graphMaxSessionHours (default 8) after the original sign-in. Off (the default) deletes the saved credentials.
+    .PARAMETER SignIn
+    How the environment signs in whenever an existing login cannot provide a token: DeviceCode, Browser (sign-in page
+    in the environment's browser profile) or Broker (Windows account manager, WAM). Default clears the setting
+    (device code). Existing logins stay valid; the method applies to the next sign-in.
     .EXAMPLE
     ctx set germany -AddTag prod -Color Red
     .EXAMPLE
     ctx set emea -PimHours 2 -AdminOnSwitch Always
     .EXAMPLE
     ctx set emea -SaveGraphCredentials On
+    .EXAMPLE
+    ctx set fabrikam -SignIn Browser
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', 'SaveGraphCredentials',
         Justification = 'An On/Off setting, not a secret.')]
@@ -391,7 +413,8 @@ function Set-CtxEnvironment {
         [string]$PimReason,
         [string]$TicketSystem,
         [ValidateSet('Ask', 'Always', 'Never', 'Default')][string]$AdminOnSwitch,
-        [ValidateSet('On', 'Off')][string]$SaveGraphCredentials
+        [ValidateSet('On', 'Off')][string]$SaveGraphCredentials,
+        [ValidateSet('DeviceCode', 'Browser', 'Broker', 'Default')][string]$SignIn
     )
     $state = Read-CtxState
     $entry = if ($Name) { Resolve-CtxEnvironment $state $Name } else { Get-CtxProcessEnvironment }
@@ -400,6 +423,12 @@ function Set-CtxEnvironment {
     if ($bound.ContainsKey('Color')) { $Color = if ($Color -ieq 'Auto') { 'Auto' } else { Assert-CtxColor $Color } }
     if ($bound.ContainsKey('GraphProfile') -and $GraphProfile -ine 'Default') { $null = Get-CtxGraphScopes $GraphProfile }
     if ($GraphClientId -and -not (Test-CtxGuid $GraphClientId)) { throw "GraphClientId must be an application (client) ID GUID." }
+    $newSignIn = if ($bound.ContainsKey('SignIn') -and $SignIn -ine 'Default') { ConvertTo-CtxSignInMethod $SignIn } else { $null }
+    if ($newSignIn -eq 'Broker' -and -not $IsWindows) { throw 'Broker (Windows account manager) is only available on Windows. Use -SignIn Browser or DeviceCode.' }
+    if ($SaveGraphCredentials -eq 'On' -and -not $IsWindows -and -not $WhatIfPreference) {
+        $why = Get-CtxSecretStoreProblem
+        if ($why) { throw "Graph credentials cannot be saved on this device: $why" }
+    }
     if (-not $PSCmdlet.ShouldProcess($targetName, 'Change ctx environment settings')) { return }
     $normTags = { param($list) @($list | Where-Object { $_ } | ForEach-Object { (ConvertTo-CtxSafeText $_).Trim().ToLowerInvariant() } | Where-Object { $_ }) }
     $null = Update-CtxState {
@@ -420,6 +449,11 @@ function Set-CtxEnvironment {
         if ($bound.ContainsKey('TicketSystem')) { $e.pim.ticketSystem = ConvertTo-CtxSafeText $TicketSystem }
         if ($bound.ContainsKey('AdminOnSwitch')) { $e.adminOnSwitch = if ($AdminOnSwitch -eq 'Default') { $null } else { $AdminOnSwitch.ToLowerInvariant() } }
         if ($bound.ContainsKey('SaveGraphCredentials')) { $e.saveGraphCredentials = ($SaveGraphCredentials -eq 'On') }
+        if ($bound.ContainsKey('SignIn')) { $e.signIn = $newSignIn }
+    }
+    if ($bound.ContainsKey('SignIn')) {
+        $effective = if ($newSignIn) { $newSignIn } else { 'DeviceCode' }
+        Write-CtxMsg ok "'$targetName' signs in $(Get-CtxSignInLabel $effective) from the next sign-in on (existing logins stay valid)."
     }
     if ($bound.ContainsKey('SaveGraphCredentials')) {
         if ($SaveGraphCredentials -eq 'Off') {
@@ -427,7 +461,7 @@ function Set-CtxEnvironment {
             Write-CtxMsg ok "Graph credentials of '$targetName' are not saved anymore (the saved copy is deleted)."
         } else {
             $t = $script:GraphToken
-            if ($t -and $script:GraphEnvName -eq $targetName -and $t.Source -eq 'DeviceCode' -and $t.RefreshToken) {
+            if ($t -and $script:GraphEnvName -eq $targetName -and $t.Source -in $script:CtxGraphRefreshSources -and $t.RefreshToken) {
                 Save-CtxGraphCredentials -Entry $t.Entry -ClientId $t.ClientId -RefreshToken $t.RefreshToken -SessionStartedAt $t.SessionStartedAt
                 Write-CtxMsg ok "Graph credentials of '$targetName' are saved now."
             } else {
@@ -519,6 +553,15 @@ function Import-CtxEnvironment {
         }
         if ($new.Contains('color')) { $new.color = try { Assert-CtxColor ([string]$new.color) } catch { $null } }
         if ($new.Contains('adminOnSwitch') -and [string]$new.adminOnSwitch -notin 'ask', 'always', 'never') { $new.adminOnSwitch = $null }
+        if ($new.Contains('signIn')) {
+            $method = ConvertTo-CtxSignInMethod ([string]$new.signIn)
+            if ($new.signIn -and -not $method) {
+                & $note warn "'$n': unknown sign-in method '$(ConvertTo-CtxSafeText ([string]$new.signIn) -MaxLength 20)' - it signs in with device code"
+            } elseif ($method -eq 'Broker' -and -not $IsWindows) {
+                & $note warn "'$n': signs in through the Windows account broker, which this device does not have - change it with 'ctx set $n -SignIn Browser'"
+            }
+            $new.signIn = $method
+        }
         if ($new.Contains('pim')) {
             $pim = [ordered]@{}
             if ($new.pim -is [System.Collections.IDictionary]) {
@@ -560,7 +603,7 @@ function Import-CtxEnvironment {
         }
     }
     foreach ($line in $report) { Write-CtxMsg $line.Kind $line.Text }
-    Write-CtxMsg dim "Imported environments sign in (device code) on their first switch."
+    Write-CtxMsg dim "Imported environments sign in on their first switch (with their sign-in method, device code by default)."
 }
 
 function Assert-CtxColor {

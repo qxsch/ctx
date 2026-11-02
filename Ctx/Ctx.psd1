@@ -1,6 +1,6 @@
 @{
     RootModule           = 'Ctx.psm1'
-    ModuleVersion        = '1.3.0'
+    ModuleVersion        = '1.4.0'
     GUID                 = '6f0b8a52-3c1e-4d3b-9a47-2f5c8e1d7b90'
     Author               = 'qxsch'
     Copyright            = '(c) qxsch. MIT License.'
@@ -22,10 +22,25 @@
     AliasesToExport      = @('ctx')
     PrivateData          = @{
         PSData = @{
-            Tags         = @('Azure', 'AzureCLI', 'Tenant', 'PIM', 'MicrosoftGraph', 'Entra', 'Windows')
+            Tags         = @('Azure', 'AzureCLI', 'Tenant', 'PIM', 'MicrosoftGraph', 'Entra', 'Windows', 'Linux', 'MacOS', 'PSEdition_Core')
             ProjectUri   = 'https://github.com/qxsch/ctx'
             LicenseUri   = 'https://github.com/qxsch/ctx/blob/main/LICENSE'
             ReleaseNotes = @'
+1.4.0
+- Linux and macOS: the data folder is ~/.local/share/ctx ($XDG_DATA_HOME) or ~/Library/Application Support/ctx
+  (owner-only, mode 700). The global environment reaches new bash/zsh/sh/fish shells through global.env, which the
+  ctx block in the shell profiles reads (never sources); on macOS also through launchctl. A lock file replaces the
+  Windows mutex. Browser discovery for Edge/Chrome/Chromium on every OS (WSL: the Windows Edge). Saved Graph
+  credentials use AES-256 + HMAC with a key in the macOS Keychain / Secret Service, or with
+  'ctx config graphCredentialStore file' in an owner-only key file. Install.ps1 / Uninstall.ps1 handle both.
+- New per-environment sign-in method: ctx add <name> -SignIn Browser|Broker, ctx set <name> -SignIn ...
+  Device code stays the default and ctx never switches methods by itself. Browser: Azure CLI and ctx's own Graph
+  sign-in (auth code + PKCE, loopback redirect) open in the environment's browser profile; Broker: Windows account
+  manager (WAM) for Azure CLI, Az PowerShell and Graph. A device-code block by Conditional Access names the fix.
+- Fewer sign-ins: before signing in, Graph also reuses the environment's Azure CLI login, and after a PIM activation
+  Az/CLI tokens count when they already carry the role (wids) or were issued after the activation started.
+- The sign-in method travels with ctx export / ctx import; ctx list, ctx st and ctx doctor show it.
+
 1.3.0
 - New, opt-in per environment: 'ctx set <name> -SaveGraphCredentials On' keeps the Graph refresh token (DPAPI-encrypted,
   current user, this device) and restores it on 'ctx <name> -Admin', 'ctx pim' and 'ctx graph' instead of a device code.

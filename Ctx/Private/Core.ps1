@@ -42,14 +42,17 @@ $script:CtxDefaultConfig = [ordered]@{
     prodTags             = @('prod', 'production')
     shareCliExtensions   = $true
     graphMaxSessionHours = 8
+    graphCredentialStore = 'keyring'
     graphScopeProfiles   = [ordered]@{}
 }
 
 # Environment fields that 'ctx export' writes and 'ctx import' accepts (everything else is device-local).
 $script:CtxPortableKeys = @(
     'name', 'tenantId', 'tenantName', 'tenantDomain', 'userObjectId', 'upn', 'tools', 'tags', 'color', 'description',
-    'graphProfile', 'graphClientId', 'adminOnSwitch', 'pim', 'azSubscriptionId', 'azSubscriptionName', 'cliSubscriptionId', 'cliSubscriptionName'
+    'graphProfile', 'graphClientId', 'adminOnSwitch', 'signIn', 'pim', 'azSubscriptionId', 'azSubscriptionName', 'cliSubscriptionId', 'cliSubscriptionName'
 )
+# How an environment signs in interactively; an environment without a setting uses DeviceCode.
+$script:CtxSignInMethods = @('DeviceCode', 'Browser', 'Broker')
 # Free-text fields that are printed to the terminal.
 $script:CtxDisplayKeys = @('tenantName', 'tenantDomain', 'upn', 'description', 'azSubscriptionName', 'cliSubscriptionName', 'graphProfile')
 $script:CtxGuidPattern = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
@@ -68,10 +71,58 @@ $script:StateCacheStamp = $null
 $script:ConfigCache = $null
 $script:ConfigCacheStamp = $null
 $script:Quiet = $false
+$script:CtxFileLockDepth = 0
+
+function Get-CtxDefaultHome {
+    <#
+    Per-OS data folder that no sync client picks up by default: %LOCALAPPDATA%\ctx on Windows,
+    ~/Library/Application Support/ctx on macOS, $XDG_DATA_HOME/ctx (~/.local/share/ctx) on Linux.
+    Spelled out instead of SpecialFolder.LocalApplicationData, whose macOS value changed between .NET versions.
+    #>
+    if ($IsWindows) { return Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'ctx' }
+    if ($IsMacOS) { return Join-Path $HOME 'Library/Application Support/ctx' }
+    $base = if ($env:XDG_DATA_HOME -and [IO.Path]::IsPathRooted($env:XDG_DATA_HOME)) { $env:XDG_DATA_HOME } else { Join-Path $HOME '.local/share' }
+    Join-Path $base 'ctx'
+}
+
+function Set-CtxPrivateMode {
+    <# Linux/macOS: owner-only access (0700 folders, 0600 files), because the folder holds Azure CLI token caches. #>
+    param([Parameter(Mandatory)][string]$Path, [switch]$Directory)
+    if ($IsWindows) { return }
+    $modeType = 'System.IO.UnixFileMode' -as [type]
+    try {
+        if ($modeType) {
+            $mode = if ($Directory) { 'UserRead, UserWrite, UserExecute' } else { 'UserRead, UserWrite' }
+            [IO.File]::SetUnixFileMode($Path, [Enum]::Parse($modeType, $mode))
+        } else {
+            & chmod $(if ($Directory) { '700' } else { '600' }) -- $Path
+        }
+    } catch { Write-Debug "ctx: could not restrict '$Path' to its owner: $_" }
+}
+
+function Get-CtxUnixMode {
+    <# Octal permission string ('700') of a path on Linux/macOS; $null on Windows or when it cannot be read. #>
+    param([Parameter(Mandatory)][string]$Path)
+    if ($IsWindows -or -not (Test-Path -LiteralPath $Path)) { return $null }
+    try {
+        if ('System.IO.UnixFileMode' -as [type]) { return [Convert]::ToString([int][IO.File]::GetUnixFileMode($Path) -band 0x1FF, 8) }
+        $item = Get-Item -LiteralPath $Path -Force
+        if ($item.PSObject.Properties['UnixMode']) {
+            $bits = 0
+            $text = ([string]$item.UnixMode).Substring(1)
+            for ($i = 0; $i -lt 9; $i++) { if ($text[$i] -ne '-') { $bits = $bits -bor (1 -shl (8 - $i)) } }
+            return [Convert]::ToString($bits, 8)
+        }
+    } catch { Write-Debug "ctx: could not read the mode of '$Path': $_" }
+    $null
+}
 
 function Get-CtxHome {
-    $dir = if ($env:CTX_HOME) { $env:CTX_HOME } else { Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'ctx' }
-    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $dir = if ($env:CTX_HOME) { $env:CTX_HOME } else { Get-CtxDefaultHome }
+    if (-not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        Set-CtxPrivateMode -Path $dir -Directory
+    }
     $dir
 }
 
@@ -79,18 +130,60 @@ function Get-CtxOneDriveRoot {
     <# Returns the OneDrive root that contains $Path, or $null when the path is not synced by OneDrive. #>
     param([string]$Path)
     if (-not $Path) { return $null }
-    $full = [IO.Path]::GetFullPath($Path).TrimEnd('\') + '\'
-    foreach ($root in @($env:OneDriveCommercial, $env:OneDriveConsumer, $env:OneDrive) | Where-Object { $_ } | Select-Object -Unique) {
-        if ($full.StartsWith($root.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { return $root }
+    $sep = [IO.Path]::DirectorySeparatorChar
+    $full = [IO.Path]::GetFullPath($Path).TrimEnd('\', '/') + $sep
+    $roots = @($env:OneDriveCommercial, $env:OneDriveConsumer, $env:OneDrive)
+    if ($IsMacOS) {
+        # OneDrive for Mac syncs folders under ~/Library/CloudStorage and sets no environment variables.
+        $roots += @(Get-ChildItem -LiteralPath (Join-Path $HOME 'Library/CloudStorage') -Directory -Filter 'OneDrive*' -ErrorAction SilentlyContinue | ForEach-Object FullName)
+    }
+    foreach ($root in @($roots | Where-Object { $_ } | Select-Object -Unique)) {
+        if ($full.StartsWith($root.TrimEnd('\', '/') + $sep, [StringComparison]::OrdinalIgnoreCase)) { return $root }
     }
     $null
 }
 
 function Get-CtxStatePath { Join-Path (Get-CtxHome) 'environments.json' }
 function Get-CtxConfigPath { Join-Path (Get-CtxHome) 'config.json' }
+function Get-CtxGlobalEnvPath { Join-Path (Get-CtxHome) 'global.env' }
 
-# User-wide environment variables (HKCU\Environment). $env:CTX_SANDBOX_USERENV redirects them to a JSON file
-# so tests and dry runs never touch the real user environment.
+# The only variables ctx sets for new processes; the shell snippet of Install.ps1 accepts no others from global.env.
+$script:CtxGlobalEnvNames = @('AZURE_CONFIG_DIR', 'AZURE_EXTENSION_DIR')
+
+function Read-CtxGlobalEnv {
+    <# Linux/macOS store of the user-wide variables: KEY=value lines in global.env (read, never sourced, by shells). #>
+    $data = [ordered]@{}
+    $path = Get-CtxGlobalEnvPath
+    if (-not (Test-Path -LiteralPath $path)) { return $data }
+    foreach ($line in [IO.File]::ReadAllLines($path)) {
+        $m = [regex]::Match($line, '^(?<k>[A-Z_][A-Z0-9_]*)=(?<v>.*)$')
+        if ($m.Success -and $script:CtxGlobalEnvNames -contains $m.Groups['k'].Value) { $data[$m.Groups['k'].Value] = $m.Groups['v'].Value }
+    }
+    $data
+}
+
+function Write-CtxGlobalEnv {
+    param([Parameter(Mandatory)][System.Collections.IDictionary]$Data)
+    $lines = @('# Written by ctx: variables for new processes (read by the ctx block in your shell profile). Do not edit.')
+    foreach ($k in $script:CtxGlobalEnvNames) { if ($Data[$k]) { $lines += "$k=$($Data[$k])" } }
+    Write-CtxFileAtomic -Path (Get-CtxGlobalEnvPath) -Content (($lines -join "`n") + "`n")
+}
+
+# Shell profiles that Install.ps1 gives a '# >>> ctx >>>' block on Linux/macOS (bash, zsh, login shells, fish).
+$script:CtxShellProfiles = @('.bashrc', '.zshenv', '.profile', '.config/fish/conf.d/ctx.fish')
+
+function Get-CtxShellProfileReaders {
+    <# Shell profiles (relative to ~) whose ctx block reads global.env. #>
+    param([string]$HomePath = $HOME)
+    foreach ($rel in $script:CtxShellProfiles) {
+        $path = Join-Path $HomePath $rel
+        if ((Test-Path -LiteralPath $path) -and ([IO.File]::ReadAllText($path) -match '# >>> ctx >>>')) { "~/$rel" }
+    }
+}
+
+# User-wide environment variables for new processes: HKCU\Environment on Windows; global.env (+ launchctl for apps
+# started by macOS) on Linux/macOS. $env:CTX_SANDBOX_USERENV redirects them to a JSON file so tests and dry runs never
+# touch the real user environment.
 function Get-CtxUserEnv {
     param([Parameter(Mandatory)][string]$Name)
     if ($env:CTX_SANDBOX_USERENV) {
@@ -98,6 +191,7 @@ function Get-CtxUserEnv {
         $data = [IO.File]::ReadAllText($env:CTX_SANDBOX_USERENV) | ConvertFrom-Json -AsHashtable
         return $(if ($data -and $data.ContainsKey($Name)) { $data[$Name] } else { $null })
     }
+    if (-not $IsWindows) { return (Read-CtxGlobalEnv)[$Name] }
     [Environment]::GetEnvironmentVariable($Name, 'User')
 }
 
@@ -109,6 +203,18 @@ function Set-CtxUserEnv {
         if (-not $data) { $data = @{} }
         if ($null -eq $Value) { $data.Remove($Name) } else { $data[$Name] = $Value }
         [IO.File]::WriteAllText($env:CTX_SANDBOX_USERENV, ($data | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+        return
+    }
+    if (-not $IsWindows) {
+        if ($script:CtxGlobalEnvNames -notcontains $Name) { throw "ctx does not manage the variable '$Name'." }
+        if ($Value -match '[\r\n]') { throw "Refusing a multi-line value for $Name." }
+        $data = Read-CtxGlobalEnv
+        if ($null -eq $Value) { $data.Remove($Name) } else { $data[$Name] = $Value }
+        Write-CtxGlobalEnv $data
+        if ($IsMacOS -and (Get-Command launchctl -CommandType Application -ErrorAction SilentlyContinue)) {
+            # Apps started from Finder or the Dock afterwards get the value, like Explorer after a Windows user-variable change.
+            if ($null -eq $Value) { & launchctl unsetenv $Name 2>$null } else { & launchctl setenv $Name $Value 2>$null }
+        }
         return
     }
     [Environment]::SetEnvironmentVariable($Name, $Value, 'User')
@@ -212,6 +318,7 @@ function Repair-CtxEnvironmentEntry {
     }
     if ($Entry['pim'] -isnot [System.Collections.IDictionary]) { $Entry['pim'] = [ordered]@{} }
     $Entry['saveGraphCredentials'] = ($Entry['saveGraphCredentials'] -eq $true)
+    $Entry['signIn'] = ConvertTo-CtxSignInMethod ([string]$Entry['signIn'])
     foreach ($k in 'role', 'reason', 'ticketSystem') {
         if ($null -ne $Entry['pim'][$k]) { $Entry['pim'][$k] = ConvertTo-CtxSafeText $Entry['pim'][$k] }
     }
@@ -251,9 +358,42 @@ function Get-CtxLockName {
     "Local\ctx-state-$([Security.Principal.WindowsIdentity]::GetCurrent().User.Value)"
 }
 
-function Invoke-CtxLocked {
-    <# Runs the body under the per-user ctx mutex (state and config writes). Throws when the lock cannot be acquired. #>
+function Invoke-CtxFileLocked {
+    <#
+    Linux/macOS: exclusive lock on <data folder>/.lock (FileShare.None = flock among .NET processes). Unlike a named
+    mutex it is shared by every login session of the user and released by the OS when a process dies. Re-entrant.
+    The body runs in a child scope of this function, so its locals carry a ctxLock prefix: a plain $path here would
+    shadow the caller's $path inside the body.
+    #>
     param([Parameter(Mandatory)][scriptblock]$LockedBody, [timespan]$Timeout = [timespan]::FromSeconds(15))
+    if ($script:CtxFileLockDepth -gt 0) {
+        $script:CtxFileLockDepth++
+        try { return & $LockedBody } finally { $script:CtxFileLockDepth-- }
+    }
+    $ctxLockFile = Join-Path (Get-CtxHome) '.lock'
+    $ctxLockDeadline = [datetime]::UtcNow.Add($Timeout)
+    $ctxLockStream = $null
+    while (-not $ctxLockStream) {
+        try {
+            $ctxLockStream = [IO.File]::Open($ctxLockFile, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        } catch [IO.IOException] {
+            if ([datetime]::UtcNow -ge $ctxLockDeadline) {
+                throw "ctx data is locked by another ctx command (waited $([int]$Timeout.TotalSeconds) s). Try again when it has finished."
+            }
+            [Threading.Thread]::Sleep(100)
+        }
+    }
+    $script:CtxFileLockDepth = 1
+    try { & $LockedBody } finally {
+        $script:CtxFileLockDepth = 0
+        $ctxLockStream.Dispose()
+    }
+}
+
+function Invoke-CtxLocked {
+    <# Runs the body under the per-user ctx lock (state and config writes). Throws when the lock cannot be acquired. #>
+    param([Parameter(Mandatory)][scriptblock]$LockedBody, [timespan]$Timeout = [timespan]::FromSeconds(15))
+    if (-not $IsWindows) { return Invoke-CtxFileLocked -LockedBody $LockedBody -Timeout $Timeout }
     $mutex = [Threading.Mutex]::new($false, (Get-CtxLockName))
     $owned = $false
     try {
@@ -411,9 +551,11 @@ function Get-CtxActiveActivations {
         if (-not $a) { continue }
         $end = ConvertTo-CtxDate $a.expiresAt
         if ($null -eq $end -or $end -gt $now) {
+            $started = try { ConvertTo-CtxDate $a.startedAt } catch { $null }
             [pscustomobject]@{
                 RoleId    = $a.roleId
                 RoleName  = $a.roleName
+                StartedAt = $started
                 ExpiresAt = $end
                 Remaining = if ($end) { $end - $now } else { $null }
             }
@@ -433,6 +575,7 @@ function Set-CtxActivationCache {
             $list.Add([ordered]@{
                 roleId    = $a.RoleId
                 roleName  = $a.RoleName
+                startedAt = if ($a.Start) { ConvertTo-CtxIsoDate $a.Start } else { $null }
                 expiresAt = if ($a.End) { ConvertTo-CtxIsoDate $a.End } else { $null }
                 type      = $a.AssignmentType
             })

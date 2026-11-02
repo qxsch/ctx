@@ -5,13 +5,14 @@ function Switch-CtxEnvironment {
     .DESCRIPTION
     Without -Local the switch is user-wide: every new terminal starts in this environment (AZURE_CONFIG_DIR user
     variable + Az PowerShell default context). Each environment keeps its own CLI login and subscription and its own
-    named Az context, so you land where you left off. Expired sessions are renewed with a device code.
+    named Az context, so you land where you left off. Expired sessions are renewed with the environment's sign-in
+    method (device code unless set with ctx set <name> -SignIn Browser|Broker).
     Afterwards ctx offers to activate the PIM role (Global Administrator) and to connect Microsoft Graph.
     .PARAMETER Name
     Environment name, a unique prefix of it, or '-' for the previous environment. Omit to get a picker.
     .PARAMETER Admin
     Activate the PIM role and connect Microsoft Graph right away. With ctx set <name> -SaveGraphCredentials On the
-    saved Graph sign-in is restored instead of asking for a device code (for graphMaxSessionHours, default 8).
+    saved Graph sign-in is restored instead of signing in again (for graphMaxSessionHours, default 8).
     .PARAMETER NoAdmin
     Do not ask about PIM / Graph.
     .PARAMETER Local
@@ -19,7 +20,7 @@ function Switch-CtxEnvironment {
     .PARAMETER NoVerify
     Skip the token checks (fastest; expired logins surface later).
     .PARAMETER Relogin
-    Sign in again with device code for Azure CLI and Az PowerShell.
+    Sign in again for Azure CLI and Az PowerShell (with the environment's sign-in method).
     .EXAMPLE
     ctx emea
     .EXAMPLE
@@ -191,7 +192,7 @@ function Save-CtxPosition {
 }
 
 function Sync-CtxCliLogin {
-    <# Completes the background token check and signs in with device code when needed. Returns the default subscription. #>
+    <# Completes the background token check and signs in (environment's sign-in method) when needed. Returns the default subscription. #>
     param([Parameter(Mandatory)]$Entry, $Handle, [bool]$Verify = $true, [switch]$Relogin)
     $reason = $null
     if ($Relogin) {
@@ -205,7 +206,7 @@ function Sync-CtxCliLogin {
     }
     if ($reason) {
         if ($reason.Length -gt 110) { $reason = $reason.Substring(0, 107) + '...' }
-        Write-CtxMsg warn "Azure CLI: $reason - signing in with device code"
+        Write-CtxMsg warn "Azure CLI: $reason - signing in $(Get-CtxSignInLabel (Get-CtxSignInMethod $Entry))"
         $id = Connect-CtxCli -Entry $Entry
         if (-not (Test-CtxIdentityMatch $Entry $id)) {
             throw "signed in as '$($id.Upn)', but '$($Entry.name)' is $($Entry.upn) in $($Entry.tenantId). Run 'ctx $($Entry.name) -Relogin' and pick the right account."

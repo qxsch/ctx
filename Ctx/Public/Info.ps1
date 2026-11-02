@@ -33,7 +33,8 @@ function Get-CtxStatus {
     $graphText = if ($script:GraphEnvName -eq $entry.name) {
         $mg = Get-CtxMgContext
         $tokenText = if ($script:GraphToken) {
-            $renew = if ($script:GraphToken.RefreshToken -or $script:GraphToken.Source -eq 'Az') { 'renews automatically' } else { "'ctx graph' to renew" }
+            $renew = if ($script:GraphToken.Source -eq 'Broker') { "'ctx graph' renews it (Windows account broker)" }
+            elseif ($script:GraphToken.RefreshToken -or $script:GraphToken.Source -in $script:CtxGraphProviderSources) { 'renews automatically' } else { "'ctx graph' to renew" }
             $maxHours = 0.0
             [void][double]::TryParse([string](Get-CtxConfig).graphMaxSessionHours, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$maxHours)
             if ($maxHours -gt 0 -and $script:GraphToken.SessionStartedAt -and $renew -eq 'renews automatically') {
@@ -69,6 +70,7 @@ function Get-CtxStatus {
     $rows = [ordered]@{
         'Tenant'        = "$($entry.tenantName) · $(Get-CtxTenantLabel $entry) · $($entry.tenantId)"
         'Login'         = "$($entry.upn) · $($entry.userObjectId)"
+        'Sign-in'       = (Get-CtxSignInMethod $entry) + $(if (-not $entry.signIn) { ' (default)' } else { '' })
         'Scope'         = $scopeText
         'Azure CLI'     = $cliText
         'Az PowerShell' = $azText
@@ -142,11 +144,12 @@ function Test-CtxSetup {
         $all = @(Get-Module -ListAvailable -Name $Name)
         if (-not $all) { & $report $Label 'warn' "not installed - needed for $Need. Elevated: Install-PSResource $Name -Scope AllUsers"; return }
         # Import-Module by name takes the highest version from the first PSModulePath folder that has the module.
-        $paths = @($env:PSModulePath -split [IO.Path]::PathSeparator | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') })
-        $root = { param($m) $paths | Where-Object { $m.ModuleBase.StartsWith("$_\", [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1 }
+        $sep = [IO.Path]::DirectorySeparatorChar
+        $paths = @($env:PSModulePath -split [IO.Path]::PathSeparator | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\', '/') })
+        $root = { param($m) $paths | Where-Object { $m.ModuleBase.StartsWith("$_$sep", [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1 }
         $firstRoot = $paths | Where-Object { $p = $_; $all | Where-Object { (& $root $_) -eq $p } } | Select-Object -First 1
         if (-not $firstRoot) { $firstRoot = Split-Path (Split-Path $all[0].ModuleBase -Parent) -Parent }
-        $used = $all | Where-Object { $_.ModuleBase.StartsWith("$firstRoot\", [StringComparison]::OrdinalIgnoreCase) } | Sort-Object Version -Descending | Select-Object -First 1
+        $used = $all | Where-Object { $_.ModuleBase.StartsWith("$firstRoot$sep", [StringComparison]::OrdinalIgnoreCase) } | Sort-Object Version -Descending | Select-Object -First 1
         if (-not $used) { $used = $all[0] }
         $best = $all | Sort-Object Version -Descending | Select-Object -First 1
         if ($best.Version -gt $used.Version) {
@@ -170,6 +173,10 @@ function Test-CtxSetup {
     } else {
         & $report 'Data folder' 'ok' "$homeDir (this device only)"
     }
+    $mode = Get-CtxUnixMode $homeDir
+    if ($mode -and ([Convert]::ToInt32($mode, 8) -band 0x3F)) {
+        & $report 'Data permissions' 'warn' "$homeDir is mode $mode - other users may read Azure CLI token caches. Fix: chmod 700 '$homeDir'"
+    }
     $moduleBase = $MyInvocation.MyCommand.Module.ModuleBase
     if ($moduleBase) {
         & $report 'Module' $(if (Get-CtxOneDriveRoot $moduleBase) { 'ok' } else { 'info' }) $(if (Get-CtxOneDriveRoot $moduleBase) { "$moduleBase (synced via OneDrive)" } else { "$moduleBase (this device only)" })
@@ -192,10 +199,15 @@ function Test-CtxSetup {
 
     if ($state) {
         $cur = Find-CtxEnvironment $state $state.current
+        $store = if ($IsWindows) { 'user variable' } else { 'global.env' }
         if ($cur -and (Test-CtxTool $cur 'cli')) {
             $userVar = (Get-CtxUserEnv 'AZURE_CONFIG_DIR')
             $want = Get-CtxCliDir $cur.name
-            & $report 'AZURE_CONFIG_DIR' $(if ($userVar -eq $want) { 'ok' } else { 'warn' }) $(if ($userVar -eq $want) { "user → $($cur.name)" } else { "user variable is '$userVar', expected '$want' - 'ctx $($cur.name)' fixes it" })
+            & $report 'AZURE_CONFIG_DIR' $(if ($userVar -eq $want) { 'ok' } else { 'warn' }) $(if ($userVar -eq $want) { "$store → $($cur.name)" } else { "$store is '$userVar', expected '$want' - 'ctx $($cur.name)' fixes it" })
+        }
+        if (-not $IsWindows -and -not $env:CTX_SANDBOX_USERENV) {
+            $readers = @(Get-CtxShellProfileReaders)
+            & $report 'Shell profiles' $(if ($readers.Count) { 'ok' } else { 'warn' }) $(if ($readers.Count) { "new shells read global.env: $($readers -join ', ')" } else { 'no shell profile reads global.env - new bash/zsh/fish shells keep ~/.azure. Run Install.ps1' })
         }
         $here = Get-CtxProcessEnvironment -Optional
         if ($here -and (Test-CtxTool $here 'cli') -and $env:AZURE_CONFIG_DIR -ne (Get-CtxCliDir $here.name)) {
@@ -220,12 +232,17 @@ function Test-CtxSetup {
         }
         $graphRoot = Join-Path (Get-CtxHome) 'graph'
         if (Test-Path -LiteralPath $graphRoot) {
-            foreach ($f in Get-ChildItem -LiteralPath $graphRoot -File) {
+            foreach ($f in Get-ChildItem -LiteralPath $graphRoot -File | Where-Object Name -NE '.key') {
                 $owner = Find-CtxEnvironment $state ([IO.Path]::GetFileNameWithoutExtension($f.Name))
                 if (-not $owner -or $owner.saveGraphCredentials -ne $true) {
                     & $report 'Saved Graph credentials' 'warn' "$($f.FullName) belongs to no environment that saves credentials - safe to delete"
                 }
             }
+        }
+        if (-not $IsWindows -and @($state.environments | Where-Object { $_.saveGraphCredentials -eq $true }).Count) {
+            $why = Get-CtxSecretStoreProblem
+            $kindText = switch (Get-CtxSecretStoreKind) { 'keychain' { 'macOS Keychain' } 'secret-service' { 'Secret Service (secret-tool)' } 'file' { "key file $(Get-CtxSecretKeyFile) (graphCredentialStore file)" } default { 'none' } }
+            & $report 'Graph credential key' $(if ($why) { 'warn' } else { 'ok' }) $(if ($why) { $why } else { $kindText })
         }
 
         $azMod = Test-CtxAzAvailable
@@ -254,6 +271,14 @@ function Test-CtxSetup {
             foreach ($e in @($state.environments | Sort-Object { $_.name })) {
                 if ($invalid[$e.name]) { continue }
                 $label = "$($e.name)"
+                $method = Get-CtxSignInMethod $e
+                if ($method -ne 'DeviceCode') {
+                    try {
+                        Assert-CtxSignInMethodSupported -Method $method -Entry $e
+                        $note = if ($e.graphClientId -and $method -eq 'Browser') { " (Graph app $($e.graphClientId) needs the redirect URI http://localhost)" } else { '' }
+                        & $report "$label · sign-in" 'ok' "$method$note"
+                    } catch { & $report "$label · sign-in" 'warn' $_.Exception.Message }
+                }
                 if ($e.saveGraphCredentials -eq $true) {
                     $gi = Get-CtxGraphCredentialInfo $e
                     if (-not $gi) { & $report "$label · graph" 'info' 'credential saving is on; nothing saved yet (saved at the next Graph sign-in)' }
@@ -373,6 +398,11 @@ function Set-CtxConfig {
 
 function ConvertTo-CtxConfigValue {
     param($Value, $Default, [string]$Name)
+    if ($Name -eq 'graphCredentialStore') {
+        $v = "$Value".Trim().ToLowerInvariant()
+        if ($v -notin 'keyring', 'file') { throw "'$Name' expects keyring (macOS Keychain / Secret Service) or file (a key file only you can read; Linux/macOS only)." }
+        return $v
+    }
     if ($Default -is [bool]) {
         if ($Value -is [bool]) { return $Value }
         $t = "$Value".Trim().ToLowerInvariant()
@@ -414,19 +444,20 @@ function Get-CtxHelp {
         'ctx - :: back to the previous environment'
         'ctx sync :: make an older terminal follow the global environment'
         '# environments'
-        'ctx add <name> [tenant] :: create (device code); same tenant + login is refused as duplicate'
+        'ctx add <name> [tenant] :: create (device code; -SignIn Browser|Broker); same tenant + login is refused as duplicate'
         'ctx list | ls :: list (* = this terminal, + = global)'
         'ctx rename <old> <new> :: rename'
         'ctx rm <name> :: remove (-SignOut, -RemoveBrowserProfile)'
         'ctx set [name] -Tags prod :: tags, -Color, -Description, -PimHours, -GraphProfile, -AdminOnSwitch'
         'ctx set [name] -SaveGraphCredentials On :: keep the Graph sign-in (encrypted, this device); -Admin restores it for graphMaxSessionHours (default 8)'
+        'ctx set [name] -SignIn Browser :: sign in in the browser profile (or Broker = Windows account manager) instead of device code'
         'ctx export | import <file> :: share definitions (no tokens)'
         '# admin'
         'ctx pim [role] :: activate (default Global Admin) + Graph; -Hours -Reason -Ticket -NoGraph'
         'ctx pim -List | -Deactivate | -Renew :: eligible/active roles, end early, start a fresh activation'
-        'ctx graph [profile] :: reuse/renew Graph: Admin, ReadOnly, Pim, custom or "Scope1,Scope2"'
+        'ctx graph [profile] :: reuse Graph (session, saved, Az, CLI login) or sign in once: Admin, ReadOnly, Pim, custom or "Scope1,Scope2"'
         'ctx graph -AddScopes "Scope1,Scope2" :: extend this session; consent only if needed'
-        'ctx graph -Relogin :: explicitly sign in with a fresh device code (ignores saved credentials)'
+        'ctx graph -Relogin :: explicitly sign in again with the environment''s method (ignores saved credentials)'
         '# everyday'
         'ctx st [-Check] :: status of this terminal'
         'ctx sub [name] :: pick subscription (CLI + Az), remembered per environment'

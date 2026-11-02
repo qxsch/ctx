@@ -223,23 +223,47 @@ function Complete-CtxCliTokenCheck {
 }
 
 function Connect-CtxCli {
-    <# Device-code login for the CLI inside the environment's config dir. Returns the identity from the token. #>
+    <#
+    Interactive Azure CLI login inside the environment's config dir, with the environment's sign-in method:
+    DeviceCode (az login --use-device-code), Browser (sign-in page in the environment's browser profile, WAM off)
+    or Broker (Windows account manager). Returns the identity from the token.
+    #>
     param([Parameter(Mandatory)]$Entry, [string]$Dir, [string]$Tenant)
     if (-not $Dir) { $Dir = Get-CtxCliDir $Entry.name }
+    $method = Get-CtxSignInMethod $Entry
+    Assert-CtxSignInMethodSupported -Method $method -Entry $Entry
     Initialize-CtxCliDir $Dir
     $az = Get-CtxAzCliPath
     if (-not $az) { throw 'Azure CLI (az) not found.' }
-    $loginArgs = @('login', '--use-device-code', '--allow-no-subscriptions', '-o', 'none')
+    $loginArgs = @('login')
+    if ($method -eq 'DeviceCode') { $loginArgs += '--use-device-code' }
+    $loginArgs += @('--allow-no-subscriptions', '-o', 'none')
     $t = if ($Tenant) { $Tenant } else { $Entry.tenantId }
     if ($t) { $loginArgs += @('--tenant', $t) }
     Assert-CtxAzCliArgument $loginArgs
+    if ($method -ne 'DeviceCode' -and $IsWindows) {
+        # Stored in the environment's own config, so later silent token requests use the same path as the sign-in.
+        Set-CtxIniValue -Path (Join-Path $Dir 'config') -Section 'core' -Key 'enable_broker_on_windows' -Value $(if ($method -eq 'Broker') { 'true' } else { 'false' })
+    }
+    $browserCommand = if ($method -eq 'Browser') { Get-CtxBrowserCommandLine $Entry } else { $null }
+    if ($method -ne 'DeviceCode') {
+        $detail = if ($method -eq 'Broker') { $null } elseif ($browserCommand) { $null } else { 'default browser - finish the sign-in there' }
+        Show-CtxSignInStart -Tool 'Azure CLI' -Entry $Entry -Method $method -Detail $detail
+    }
     $saved = $env:AZURE_CONFIG_DIR
+    $savedBrowser = $env:BROWSER
     try {
         $env:AZURE_CONFIG_DIR = $Dir
+        if ($browserCommand) { $env:BROWSER = $browserCommand }
         $sb = { & $az @loginArgs }.GetNewClosure()
-        Invoke-CtxDeviceLogin -ScriptBlock $sb -Entry $Entry -Tool 'Azure CLI' -Native | Out-Null
+        Invoke-CtxToolLogin -ScriptBlock $sb -Entry $Entry -Tool 'Azure CLI' -Native | Out-Null
+    } catch {
+        $hint = Get-CtxSignInFailureHint -Message $_.Exception.Message -Method $method -Entry $Entry
+        if ($hint) { throw "$($_.Exception.Message)$hint" }
+        throw
     } finally {
         $env:AZURE_CONFIG_DIR = $saved
+        $env:BROWSER = $savedBrowser
     }
     $tenantArg = if ($t) { @('--tenant', $t) } else { @() }
     $tok = Invoke-CtxAzCli -ConfigDir $Dir -Arguments (@('account', 'get-access-token', '--query', 'accessToken', '-o', 'tsv') + $tenantArg)

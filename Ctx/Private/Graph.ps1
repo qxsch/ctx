@@ -1,9 +1,14 @@
-# Microsoft Graph: device-code sessions bound to this terminal, scope profiles Admin / ReadOnly / Pim / custom.
-# Cached tokens are reused before falling back to ctx's device-code flow (SDK issue #3495).
+# Microsoft Graph: sessions bound to this terminal, scope profiles Admin / ReadOnly / Pim / custom.
+# Before any interactive sign-in, every existing login of the environment is asked for a token (this terminal's
+# session, saved credentials, Az PowerShell, Azure CLI). Only then ctx signs in with the environment's method:
+# its own device-code flow (SDK issue #3495), its own browser flow (auth code + PKCE), or the Windows broker (WAM).
 # Graph refresh tokens stay in this process' memory, unless the environment opts in to saved credentials (GraphStore.ps1).
 
 $script:CtxGraphClientId = '14d82eec-204b-4c2f-b7e8-296a70dab67e'   # Microsoft Graph Command Line Tools
 $script:CtxLoginHost = 'https://login.microsoftonline.com'
+# Sessions that ctx renews with its own refresh token, and sessions it renews by asking their provider again.
+$script:CtxGraphRefreshSources = @('DeviceCode', 'Browser')
+$script:CtxGraphProviderSources = @('Az', 'Cli', 'Broker')
 
 $script:CtxAdminScopes = @(
     # Keep Application.Read.All too: the Fabric setup script checks for that exact scope.
@@ -217,6 +222,154 @@ function Request-CtxGraphDeviceToken {
     throw "$Tool sign-in code expired - run the command again."
 }
 
+function Get-CtxCliGraphToken {
+    <# Graph token from the environment's Azure CLI login (az account get-access-token); $null when it has none. #>
+    param([Parameter(Mandatory)]$Entry)
+    if (-not (Test-CtxTool $Entry 'cli') -or -not (Get-CtxAzCliPath)) { return }
+    $dir = Get-CtxCliDir $Entry.name
+    if (-not (Get-CtxCliProfile $dir)) { return }
+    $r = Invoke-CtxAzCli -ConfigDir $dir -Json -Arguments @(
+        'account', 'get-access-token', '--resource-type', 'ms-graph', '--tenant', [string]$Entry.tenantId, '-o', 'json', '--only-show-errors')
+    if (-not $r.Success -or -not $r.Value -or -not $r.Value.accessToken) { return }
+    $expires = if ($r.Value.expires_on) { [DateTimeOffset]::FromUnixTimeSeconds([long]$r.Value.expires_on).UtcDateTime } else { $null }
+    [pscustomobject]@{
+        access_token = [string]$r.Value.accessToken
+        expires_in   = if ($expires) { [int]($expires - [datetime]::UtcNow).TotalSeconds } else { 3000 }
+    }
+}
+
+function Get-CtxProviderGraphToken {
+    <# Asks a token provider again (renewal or reuse). Az and Azure CLI return what their login allows; Broker may show WAM UI. #>
+    param(
+        [Parameter(Mandatory)][ValidateSet('Az', 'Cli', 'Broker')][string]$Source,
+        [Parameter(Mandatory)]$Entry,
+        [string]$ClientId,
+        [string]$Scope
+    )
+    switch ($Source) {
+        'Az' { Get-CtxAzGraphToken -Entry $Entry }
+        'Cli' { Get-CtxCliGraphToken -Entry $Entry }
+        'Broker' { Request-CtxGraphBrokerToken -Entry $Entry -ClientId $ClientId -Scope $Scope -Tool 'Microsoft Graph' -Quiet }
+    }
+}
+
+function Request-CtxGraphBrowserToken {
+    <#
+    Authorization code flow with PKCE (RFC 7636) and a loopback redirect (RFC 8252): the sign-in page opens in the
+    environment's browser profile with the account as login hint, and the browser returns to http://localhost:<port>.
+    Returns the token response (with a refresh token, renewed like a device-code session).
+    #>
+    param(
+        [Parameter(Mandatory)]$Entry,
+        [Parameter(Mandatory)][string]$ClientId,
+        [Parameter(Mandatory)][string]$Scope,
+        [Parameter(Mandatory)][string]$Tool,
+        [int]$TimeoutSeconds = 300
+    )
+    $pkce = New-CtxPkce
+    $state = New-CtxRandomString 24
+    $listener = Start-CtxLoopbackListener
+    try {
+        $redirect = "http://localhost:$($listener.Port)"
+        $query = [ordered]@{
+            client_id             = $ClientId
+            response_type         = 'code'
+            redirect_uri          = $redirect
+            response_mode         = 'query'
+            scope                 = $Scope
+            state                 = $state
+            code_challenge        = $pkce.Challenge
+            code_challenge_method = 'S256'
+        }
+        if ($Entry.upn) { $query.login_hint = [string]$Entry.upn }
+        $url = "$script:CtxLoginHost/$($Entry.tenantId)/oauth2/v2.0/authorize?" +
+            (($query.Keys | ForEach-Object { "$_=$([uri]::EscapeDataString([string]$query[$_]))" }) -join '&')
+        Show-CtxSignInStart -Tool $Tool -Entry $Entry -Method 'Browser'
+        try { Open-CtxBrowser -Url $url -Entry $Entry }
+        catch { Write-Host "     open this address in the browser profile '$($Entry.browserProfile)': $url" -ForegroundColor Cyan }
+        $answer = Wait-CtxLoopbackRedirect -Listener $listener -State $state -TimeoutSeconds $TimeoutSeconds
+    } finally {
+        Stop-CtxLoopbackListener $listener
+    }
+    if ($answer.Error) {
+        $text = if ($answer.Description) { Get-CtxOAuthErrorText ([pscustomobject]@{ error = $answer.Error; error_description = $answer.Description }) } else { $answer.Error }
+        if ($answer.Error -eq 'access_denied' -and -not $answer.Description) { throw "$Tool sign-in was declined in the browser." }
+        throw "$Tool sign-in failed: $text"
+    }
+    $t = Invoke-CtxOAuth -TenantId $Entry.tenantId -Endpoint token -Body @{
+        grant_type    = 'authorization_code'
+        client_id     = $ClientId
+        code          = $answer.Code
+        redirect_uri  = $redirect
+        code_verifier = $pkce.Verifier
+        scope         = $Scope
+    }
+    if (-not $t.access_token) { throw "$Tool sign-in failed: $(Get-CtxOAuthErrorText $t)" }
+    $t
+}
+
+function Request-CtxGraphBrokerToken {
+    <#
+    Graph token through the Windows account broker (WAM) of the Graph SDK: Connect-MgGraph with the environment's
+    tenant, Graph app, scopes and account as login hint. ctx only takes the access token from that connection and
+    disconnects it again; Set-CtxGraphToken then checks tenant, user and scopes before the token is connected.
+    #>
+    param(
+        [Parameter(Mandatory)]$Entry,
+        [Parameter(Mandatory)][string]$ClientId,
+        [Parameter(Mandatory)][string]$Scope,
+        [Parameter(Mandatory)][string]$Tool,
+        [switch]$Quiet
+    )
+    if (-not $IsWindows) { throw "$Tool sign-in through the Windows account broker is only available on Windows." }
+    Import-CtxGraphModule
+    $option = try { Get-MgGraphOption -ErrorAction Stop } catch { $null }
+    if ($option -and $option.PSObject.Properties['DisableLoginByWAM'] -and $option.DisableLoginByWAM) {
+        throw "$Tool cannot use the Windows account broker: it is disabled for the Graph SDK (Set-MgGraphOption -DisableLoginByWAM `$false enables it)."
+    }
+    $scopes = @($Scope -split ' ' | Where-Object { $_ -and $_ -notin 'offline_access', 'openid', 'profile' })
+    $p = @{ TenantId = $Entry.tenantId; ClientId = $ClientId; Scopes = $scopes; ContextScope = 'Process'; NoWelcome = $true; ErrorAction = 'Stop' }
+    if ($Entry.upn -and (Get-Command Connect-MgGraph).Parameters.ContainsKey('LoginHint')) { $p.LoginHint = [string]$Entry.upn }
+    if (-not $Quiet) { Show-CtxSignInStart -Tool $Tool -Entry $Entry -Method 'Broker' }
+    $token = $null
+    try {
+        Connect-MgGraph @p | Out-Null
+        $response = Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/me?$select=id' -OutputType HttpResponseMessage -ErrorAction Stop
+        try {
+            $auth = $response.RequestMessage.Headers.Authorization
+            if ($auth -and $auth.Scheme -ieq 'Bearer') { $token = [string]$auth.Parameter }
+        } finally { $response.Dispose() }
+    } finally {
+        Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+    }
+    if (-not $token) { throw "$Tool sign-in failed: the Windows account broker returned no access token." }
+    [pscustomobject]@{ access_token = $token }
+}
+
+function Request-CtxGraphInteractiveToken {
+    <# One interactive Graph sign-in with the environment's method. Returns @{ Response; Source }. #>
+    param(
+        [Parameter(Mandatory)]$Entry,
+        [Parameter(Mandatory)][string]$ClientId,
+        [Parameter(Mandatory)][string]$Scope,
+        [Parameter(Mandatory)][string]$Tool
+    )
+    $method = Get-CtxSignInMethod $Entry
+    Assert-CtxSignInMethodSupported -Method $method -Entry $Entry
+    try {
+        $response = switch ($method) {
+            'Browser' { Request-CtxGraphBrowserToken -Entry $Entry -ClientId $ClientId -Scope $Scope -Tool $Tool }
+            'Broker' { Request-CtxGraphBrokerToken -Entry $Entry -ClientId $ClientId -Scope $Scope -Tool $Tool }
+            default { Request-CtxGraphDeviceToken -Entry $Entry -ClientId $ClientId -Scope $Scope -Tool $Tool }
+        }
+    } catch {
+        $hint = Get-CtxSignInFailureHint -Message $_.Exception.Message -Method $method -Entry $Entry
+        if ($hint) { throw "$($_.Exception.Message)$hint" }
+        throw
+    }
+    @{ Response = $response; Source = $method }
+}
+
 function Connect-CtxGraphToken {
     <# Hands an access token to the Graph SDK. Calling it again swaps the token in place (same session, new token). #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingConvertToSecureStringWithPlainText', '',
@@ -232,7 +385,7 @@ function Set-CtxGraphToken {
         [Parameter(Mandatory)]$Entry,
         [Parameter(Mandatory)][string]$ClientId,
         [Parameter(Mandatory)][string]$Scope,
-        [ValidateSet('DeviceCode', 'Az')][string]$Source = 'DeviceCode',
+        [ValidateSet('DeviceCode', 'Browser', 'Broker', 'Az', 'Cli')][string]$Source = 'DeviceCode',
         [string]$PreviousRefreshToken,
         # Start of the sign-in this token belongs to (kept across renewals; bounded by graphMaxSessionHours).
         [Nullable[datetime]]$SessionStartedAt
@@ -274,6 +427,8 @@ function Set-CtxGraphToken {
         LastError     = $null
         ErrorCode     = $null
         Warned        = $false
+        # Broker sessions only: lets a failed renewal reconnect the still valid token (memory only, like the SDK's copy).
+        AccessToken   = if ($Source -eq 'Broker') { [string]$Response.access_token } else { $null }
     }
     # The SDK may spell an account differently from the identity helper, especially for guest UPNs.
     $context = Get-CtxMgContext
@@ -281,18 +436,21 @@ function Set-CtxGraphToken {
         $script:GraphToken.Account = [string]$context.Account
         $script:GraphToken.TokenClientId = [string]$context.ClientId
     }
-    if ($Source -eq 'DeviceCode' -and $Response.refresh_token -and (Test-CtxGraphCredentialsEnabled $Entry.name)) {
+    if ($Source -in $script:CtxGraphRefreshSources -and $Response.refresh_token -and (Test-CtxGraphCredentialsEnabled $Entry.name)) {
         Save-CtxGraphCredentials -Entry $Entry -ClientId $ClientId -RefreshToken ([string]$Response.refresh_token) -SessionStartedAt $script:GraphToken.SessionStartedAt
     }
 }
 
 function Update-CtxGraphToken {
     <#
-    Keeps this terminal's ctx Graph session alive: renews the access token with the in-memory refresh token when it
-    expires within MinMinutes. With -Force, success requires a new token, not just an unexpired old token.
-    -Quiet (timer) defers renewal warnings to the next prompt / ctx command.
+    Keeps this terminal's ctx Graph session alive when the token expires within MinMinutes: sessions of ctx's own
+    sign-ins renew with the in-memory refresh token, sessions from Az, Azure CLI or the broker ask that provider again.
+    With -Force, success requires a new token, not just an unexpired old token; after a PIM activation a provider's
+    cached token from before the activation does not count. -Quiet defers renewal warnings to the next prompt / ctx
+    command. The broker is only asked with -AllowBroker (ctx commands): WAM may show its dialog, which must never pop
+    up unannounced from the timer or while the prompt is drawn - those only hint at 'ctx graph' before expiry.
     #>
-    param([double]$MinMinutes = 15, [switch]$Quiet, [switch]$Force, [string[]]$Scopes)
+    param([double]$MinMinutes = 15, [switch]$Quiet, [switch]$Force, [string[]]$Scopes, [switch]$AllowBroker)
     $t = $script:GraphToken
     if (-not $t) { return $false }
     $now = [datetime]::UtcNow
@@ -307,8 +465,16 @@ function Update-CtxGraphToken {
         return $false
     }
     if (-not $Force -and $t.ExpiresAt -gt $now.AddMinutes($MinMinutes)) { return $true }
-    $scope = if ($Scopes) { Get-CtxGraphScopeString $Scopes } else { $t.Scope }
     $valid = $t.ExpiresAt -gt $now.AddMinutes(1)
+    if ($t.Source -eq 'Broker' -and -not $AllowBroker) {
+        if (-not $Quiet -and -not $t.Warned) {
+            $t.Warned = $true
+            $when = if ($valid) { "expires $($t.ExpiresAt.ToLocalTime().ToString('HH:mm'))" } else { 'expired' }
+            Write-Host "  ctx: Microsoft Graph token from the Windows account broker $when - 'ctx graph' renews it." -ForegroundColor Yellow
+        }
+        return $valid
+    }
+    $scope = if ($Scopes) { Get-CtxGraphScopeString $Scopes } else { $t.Scope }
     if ($Force -or -not ($t.RetryAfter -and $now -lt $t.RetryAfter)) {
         $r = $null
         $maxHours = 0.0
@@ -319,13 +485,19 @@ function Update-CtxGraphToken {
                 if ($t.RefreshToken -and $t.Entry) { Remove-CtxGraphCredentials -Name $t.Entry.name -RefreshToken $t.RefreshToken }
                 $t.RefreshToken = $null
                 $r = [pscustomobject]@{ error = 'login_required'; error_description = "The Graph session reached graphMaxSessionHours ($maxHours h) and is no longer renewed." }
-            } elseif ($t.Source -eq 'Az') {
-                # Get-AzAccessToken has no force-refresh parameter; do not pretend its cached token is new after PIM.
-                if ($Force) {
-                    $r = [pscustomobject]@{ error = 'interaction_required'; error_description = 'A fresh Graph token is needed; Az cannot force-refresh its cached token.' }
-                } else {
-                    $r = Get-CtxAzGraphToken -Entry $t.Entry
-                    if (-not $r) { $r = [pscustomobject]@{ error = 'login_required'; error_description = 'The matching Az context is no longer available.' } }
+            } elseif ($t.Source -in $script:CtxGraphProviderSources) {
+                # Re-read the environment: a PIM activation since the sign-in changes what counts as fresh.
+                $current = try { Find-CtxEnvironment (Read-CtxState) $t.Entry.name } catch { $null }
+                if (-not $current) { $current = $t.Entry }
+                $label = switch ($t.Source) { 'Az' { 'Az PowerShell' } 'Cli' { 'Azure CLI' } default { 'the Windows account broker' } }
+                $r = Get-CtxProviderGraphToken -Source $t.Source -Entry $current -ClientId $t.ClientId -Scope $scope
+                if (-not $r) {
+                    $r = [pscustomobject]@{ error = 'login_required'; error_description = "The matching $label login is no longer available." }
+                } elseif ($Force -and $t.Source -ne 'Broker' -and -not (Test-CtxGraphTokenFresh -AccessToken $r.access_token -Entry $current)) {
+                    # Az and Azure CLI cannot force-refresh their cached token; do not pretend it is new after PIM.
+                    $r = [pscustomobject]@{ error = 'interaction_required'; error_description = "A fresh Graph token is needed; $label returned its cached token from before the PIM activation." }
+                } elseif ($Force -and $t.Source -eq 'Broker' -and -not (Test-CtxGraphTokenFresh -AccessToken $r.access_token -Entry $current)) {
+                    Write-CtxMsg warn "The Windows account broker returned a Graph token from before the PIM activation; admin calls may need the role until it renews."
                 }
             } elseif ($t.RefreshToken) {
                 $r = Invoke-CtxOAuth -TenantId $t.TenantId -Endpoint token -TimeoutSec 10 -Body @{
@@ -348,6 +520,10 @@ function Update-CtxGraphToken {
                 $r = [pscustomobject]@{ error = $code; error_description = $_.Exception.Message }
             }
         }
+        if ($t.Source -eq 'Broker' -and $t.AccessToken -and $valid -and -not (Get-CtxMgContext)) {
+            # Asking the broker replaced the SDK connection; put the still valid token back.
+            try { Connect-CtxGraphToken $t.AccessToken } catch { Write-Debug "ctx: could not reconnect the previous Graph token: $_" }
+        }
         $t.RetryAfter = $now.AddMinutes(2)
         # A consent failure for added scopes does not invalidate the original session's refresh token.
         if ($r.error -eq 'invalid_grant' -and $scope -eq $t.Scope) {
@@ -369,15 +545,42 @@ function Test-CtxGraphSession {
     <# True when this terminal holds a Graph session for the environment with all required scopes. #>
     param([Parameter(Mandatory)]$Entry, [string[]]$RequiredScopes)
     if ($script:GraphEnvName -ne $Entry.name) { return $false }
-    if (-not (Update-CtxGraphToken)) { return $false }
+    if (-not (Update-CtxGraphToken -AllowBroker)) { return $false }
     $ctx = Get-CtxMgContext
     if (-not $ctx -or $ctx.TenantId -ine $Entry.tenantId) { return $false }
     if ($script:GraphToken.ObjectId -ine $Entry.userObjectId) { return $false }
     @(Get-CtxMissingGraphScopes -Granted $ctx.Scopes -Required $RequiredScopes).Count -eq 0
 }
 
+function Connect-CtxGraphFromLogins {
+    <#
+    Reuses the environment's Az PowerShell, then Azure CLI login for Graph: official token APIs only, accepted only
+    for the same tenant + user with the required scopes and, after a PIM activation (-Refresh), only when the token
+    already reflects the activation. $true when a Graph session is connected.
+    #>
+    param([Parameter(Mandatory)]$Entry, [Parameter(Mandatory)][string]$ClientId, [Parameter(Mandatory)][string]$Scope, [switch]$Refresh)
+    foreach ($source in 'Az', 'Cli') {
+        $label = if ($source -eq 'Az') { 'Az PowerShell' } else { 'Azure CLI' }
+        try {
+            $cached = Get-CtxProviderGraphToken -Source $source -Entry $Entry
+            if (-not $cached) { continue }
+            if ($Refresh -and -not (Test-CtxGraphTokenFresh -AccessToken $cached.access_token -Entry $Entry)) {
+                Write-CtxMsg dim "The $label Graph token is from before the PIM activation."
+                continue
+            }
+            Set-CtxGraphToken -Response $cached -Entry $Entry -ClientId $ClientId -Scope $Scope -Source $source
+            Write-CtxMsg dim "Microsoft Graph is using the matching $label login (no sign-in needed)."
+            return $true
+        } catch { Write-CtxMsg dim "The $label Graph token cannot be used: $($_.Exception.Message)" }
+    }
+    $false
+}
+
 function Connect-CtxGraphSession {
-    <# Reuses or silently renews matching credentials before asking for a device code. #>
+    <#
+    Asks every existing login of the environment for a suitable token (this terminal's session, saved credentials,
+    Az PowerShell, Azure CLI) before one interactive sign-in with the environment's method.
+    #>
     param(
         [Parameter(Mandatory)]$Entry,
         [Parameter(Mandatory)][string[]]$Scopes,
@@ -391,45 +594,38 @@ function Connect-CtxGraphSession {
     $ready = $false
     if (-not $Relogin -and $script:GraphEnvName -eq $Entry.name -and $script:GraphToken -and
         $script:GraphToken.ObjectId -ieq $Entry.userObjectId -and $script:GraphToken.ClientId -eq $clientId) {
-        $usable = Update-CtxGraphToken -Quiet
+        $usable = Update-CtxGraphToken -Quiet -AllowBroker
         $t = $script:GraphToken
         if ($t) {
             if (-not $usable -and $t.LastError -and $t.ErrorCode -notin 'interaction_required', 'consent_required', 'login_required', 'invalid_grant') {
                 throw "Microsoft Graph token renewal failed: $($t.LastError)"
             }
             $missing = @(Get-CtxMissingGraphScopes -Granted $t.Scopes -Required $Scopes)
-            if (-not $Refresh -and $usable -and -not $missing.Count -and ($t.Scope -eq $scope -or $t.Source -eq 'Az')) {
+            if (-not $Refresh -and $usable -and -not $missing.Count -and ($t.Scope -eq $scope -or $t.Source -in $script:CtxGraphProviderSources)) {
                 $t.Scope = $scope
                 $ready = $true
             } else {
-                $ready = Update-CtxGraphToken -Force -Scopes $Scopes -Quiet
+                $ready = Update-CtxGraphToken -Force -Scopes $Scopes -Quiet -AllowBroker
                 if (-not $ready -and $t.ErrorCode -notin 'interaction_required', 'consent_required', 'login_required', 'invalid_grant') {
                     throw "Microsoft Graph token renewal failed: $($t.LastError)"
                 }
-                if (-not $ready) { Write-CtxMsg dim "Microsoft Graph needs device authentication: $($t.LastError)" }
+                if (-not $ready) { Write-CtxMsg dim "Microsoft Graph needs a new sign-in: $($t.LastError)" }
             }
         }
     }
     if (-not $ready -and -not $Relogin) {
         $ready = Restore-CtxGraphCredentials -Entry $Entry -ClientId $clientId -Scope $scope
     }
-    if (-not $ready -and -not $Refresh -and -not $Relogin -and -not $Entry.graphClientId) {
-        try {
-            $cached = Get-CtxAzGraphToken -Entry $Entry
-            if ($cached) {
-                Set-CtxGraphToken -Response $cached -Entry $Entry -ClientId $clientId -Scope $scope -Source Az
-                Write-CtxMsg dim 'Microsoft Graph is using the matching cached Az login (no device code).'
-                $ready = $true
-            }
-        } catch { Write-CtxMsg dim "Cached Az Graph token cannot be used: $($_.Exception.Message)" }
+    if (-not $ready -and -not $Relogin -and -not $Entry.graphClientId) {
+        $ready = Connect-CtxGraphFromLogins -Entry $Entry -ClientId $clientId -Scope $scope -Refresh:$Refresh
     }
     if (-not $ready) {
-        $tok = Request-CtxGraphDeviceToken -Entry $Entry -ClientId $clientId -Scope $scope -Tool "Microsoft Graph ($Label)"
-        Set-CtxGraphToken -Response $tok -Entry $Entry -ClientId $clientId -Scope $scope
+        $signIn = Request-CtxGraphInteractiveToken -Entry $Entry -ClientId $clientId -Scope $scope -Tool "Microsoft Graph ($Label)"
+        Set-CtxGraphToken -Response $signIn.Response -Entry $Entry -ClientId $clientId -Scope $scope -Source $signIn.Source
     }
     $script:GraphEnvName = $Entry.name
     $script:GraphProfileName = $Label
-    if ($script:GraphToken.RefreshToken -or $script:GraphToken.Source -eq 'Az') { Start-CtxGraphRenewal }
+    if ($script:GraphToken.RefreshToken -or $script:GraphToken.Source -in $script:CtxGraphProviderSources) { Start-CtxGraphRenewal }
     [pscustomobject]@{
         Account   = $script:GraphToken.Account
         TenantId  = $script:GraphToken.TenantId

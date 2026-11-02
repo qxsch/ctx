@@ -177,7 +177,7 @@ function Wait-CtxPimActive {
 }
 
 function Use-CtxPimGraph {
-    <# Include the final profile in the first sign-in so PIM does not require a second device code. #>
+    <# Include the final profile in the first sign-in so PIM does not require a second sign-in. #>
     param([Parameter(Mandatory)]$Entry, [string]$GraphProfile)
     $scopes = Get-CtxGraphScopes 'Pim'
     if (Test-CtxGraphSession -Entry $Entry -RequiredScopes $scopes) { return }

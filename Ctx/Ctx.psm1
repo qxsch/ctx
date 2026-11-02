@@ -1,10 +1,8 @@
 #Requires -Version 7.2
 # ctx - environment (tenant + login) switcher for Azure CLI, Az PowerShell, PIM and Microsoft Graph.
-# Persistent data lives in %LOCALAPPDATA%\ctx (override with $env:CTX_HOME); this folder only holds code.
+# Runs on Windows, Linux and macOS. Persistent data lives in %LOCALAPPDATA%\ctx, ~/Library/Application Support/ctx or
+# ~/.local/share/ctx (override with $env:CTX_HOME); this folder only holds code.
 
-if (-not $IsWindows) {
-    throw 'ctx supports Windows only (it uses %LOCALAPPDATA%, user environment variables, az.cmd and Edge/Chrome profiles).'
-}
 # Version 1.0 rejects uninitialized variables (typos, missing assignments) without changing property access semantics.
 Set-StrictMode -Version 1.0
 

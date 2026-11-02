@@ -1,4 +1,4 @@
-# Token decoding and device-code sign-in helper (clipboard + browser profile per environment).
+# Token decoding and the sign-in wrapper of Azure CLI / Az PowerShell (device codes: clipboard + browser profile per environment).
 
 function ConvertFrom-CtxJwt {
     param([Parameter(Mandatory)][string]$Token)
@@ -60,7 +60,8 @@ function Show-CtxDeviceCode {
     Write-Host '  │  code: ' -NoNewline -ForegroundColor Cyan
     Write-Host $Code -ForegroundColor Yellow -NoNewline
     if ($cfg.deviceCodeClipboard) {
-        try { Set-Clipboard -Value $Code; Write-Host '   (copied to clipboard, paste with Ctrl+V)' -ForegroundColor DarkGray }
+        $paste = if ($IsMacOS) { '⌘V' } else { 'Ctrl+V' }
+        try { Set-Clipboard -Value $Code; Write-Host "   (copied to clipboard, paste with $paste)" -ForegroundColor DarkGray }
         catch { Write-Host '' }
     } else { Write-Host '' }
     Write-Host "  │  url:  $Url" -ForegroundColor Cyan
@@ -75,11 +76,11 @@ function Show-CtxDeviceCode {
     }
 }
 
-function Invoke-CtxDeviceLogin {
+function Invoke-CtxToolLogin {
     <#
-    Runs a device-code sign-in script block, intercepting the "enter the code XXXX" message from any stream
-    (Graph: output, Az: information, az CLI: stderr) to copy the code and open the right browser profile.
-    Other records are passed through; with -Native the native exit code is checked.
+    Runs a sign-in script block of Azure CLI or Az PowerShell. A device-code message ("enter the code XXXX") from any
+    stream (Az: information, az CLI: stderr) is intercepted to copy the code and open the right browser profile;
+    browser and broker sign-ins pass their records through. With -Native the native exit code is checked.
     #>
     param(
         [Parameter(Mandatory)][scriptblock]$ScriptBlock,
@@ -112,8 +113,10 @@ function Invoke-CtxDeviceLogin {
         if ($rec -is [System.Management.Automation.ErrorRecord]) {
             if ($Native) {
                 $stderrLines.Add($text)
-                # az prints Python tracebacks on unexpected errors; only the readable lines are shown.
-                if ($text.Trim() -and $text -notmatch '^\s*(ERROR:|Traceback|File "|During handling|To check existing|\w+(Error|Exception):)') {
+                # az prints Python tracebacks on unexpected errors; only the readable lines are shown. Its browser
+                # sign-in also suggests --use-device-code, which ctx never falls back to by itself.
+                if ($text.Trim() -and $text -notmatch '^\s*(ERROR:|Traceback|File "|During handling|To check existing|\w+(Error|Exception):)' -and
+                    $text -notmatch 'web browser has been opened|If no web browser is available') {
                     Write-Host "    $text" -ForegroundColor DarkGray
                 }
             } else {

@@ -222,9 +222,13 @@ function Show-CtxMenu {
 }
 
 function Get-CtxEditorCommand {
-    <# Editor for 'ctx config -Edit': command first, then its arguments ($env:EDITOR may be 'code --wait'). #>
-    $spec = $env:EDITOR
-    if (-not $spec) { return $(if (Get-Command code -ErrorAction SilentlyContinue) { 'code' } else { 'notepad' }) }
+    <# Editor for 'ctx config -Edit': command first, then its arguments ($env:VISUAL / $env:EDITOR may be 'code --wait'). #>
+    $spec = if ($env:VISUAL -and -not $IsWindows) { $env:VISUAL } else { $env:EDITOR }
+    if (-not $spec) {
+        $fallbacks = if ($IsWindows) { @('code', 'notepad') } else { @('code', 'nano', 'vi') }
+        $found = $fallbacks | Where-Object { Get-Command $_ -ErrorAction SilentlyContinue } | Select-Object -First 1
+        return $(if ($found) { $found } else { $fallbacks[-1] })
+    }
     if (Get-Command $spec -ErrorAction SilentlyContinue) { return $spec }
     @([regex]::Matches($spec, '"[^"]*"|\S+') | ForEach-Object { $_.Value.Trim('"') })
 }
@@ -233,8 +237,10 @@ function Test-CtxModuleSignature {
     <#
     Authenticode state of the module files for 'ctx doctor'. Once any file is signed (or carries a signature block),
     every file must still verify: text appended after a signature turns it into "not signed", not "hash mismatch".
+    Authenticode exists on Windows only; elsewhere the module is installed per device and not synced.
     #>
     param([Parameter(Mandatory)][string]$ModuleBase)
+    if (-not $IsWindows) { return [pscustomobject]@{ Status = 'info'; Detail = 'Authenticode signatures are only checked on Windows' } }
     $checks = foreach ($name in 'Ctx.psm1', 'Ctx.psd1', 'Ctx.Format.ps1xml') {
         $file = Join-Path $ModuleBase $name
         if (-not (Test-Path -LiteralPath $file)) { continue }
